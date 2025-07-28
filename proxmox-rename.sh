@@ -67,7 +67,7 @@ stop_services_safely() {
         fi
     done
     
-    # Gracefully stop pmxcfs
+    # Gracefully stop pmxcfs and clean up mount
     if pgrep pmxcfs > /dev/null; then
         log "Stopping pmxcfs..."
         pkill -TERM pmxcfs
@@ -78,35 +78,95 @@ stop_services_safely() {
             sleep 2
         fi
     fi
+    
+    # Clean up any stale /etc/pve mounts
+    if mountpoint -q /etc/pve; then
+        log "Unmounting /etc/pve filesystem..."
+        umount /etc/pve || {
+            log "Force unmounting /etc/pve..."
+            umount -f /etc/pve 2>/dev/null || true
+            umount -l /etc/pve 2>/dev/null || true
+        }
+    fi
+    
+    # Kill any remaining pmxcfs processes
+    pkill -9 pmxcfs 2>/dev/null || true
+    sleep 2
 }
 
 start_services_safely() {
     log "Starting Proxmox services..."
     
-    # Start cluster service first
-    systemctl start pve-cluster
+    # Ensure /etc/pve is not mounted before starting
+    if mountpoint -q /etc/pve; then
+        log "Cleaning up stale /etc/pve mount..."
+        umount /etc/pve 2>/dev/null || umount -f /etc/pve 2>/dev/null || umount -l /etc/pve 2>/dev/null || true
+    fi
+    
+    # Kill any remaining pmxcfs processes
+    pkill -9 pmxcfs 2>/dev/null || true
+    sleep 2
+    
+    # Start cluster service first with retries
+    log "Starting pve-cluster service..."
+    local cluster_attempts=0
+    local max_attempts=3
+    
+    while [ $cluster_attempts -lt $max_attempts ]; do
+        systemctl start pve-cluster
+        sleep 5
+        
+        if systemctl is-active --quiet pve-cluster; then
+            log "pve-cluster started successfully"
+            break
+        else
+            ((cluster_attempts++))
+            log "pve-cluster start attempt $cluster_attempts failed, retrying..."
+            
+            # Clean up and try again
+            systemctl stop pve-cluster 2>/dev/null || true
+            pkill -9 pmxcfs 2>/dev/null || true
+            if mountpoint -q /etc/pve; then
+                umount -f /etc/pve 2>/dev/null || umount -l /etc/pve 2>/dev/null || true
+            fi
+            sleep 3
+            
+            if [ $cluster_attempts -eq $max_attempts ]; then
+                log "ERROR: pve-cluster failed to start after $max_attempts attempts"
+                log "This may require manual intervention"
+                return 1
+            fi
+        fi
+    done
+    
+    # Wait for pmxcfs to be ready
     local timeout=30
-    while ! systemctl is-active --quiet pve-cluster && [ $timeout -gt 0 ]; do
+    while [ $timeout -gt 0 ] && ! mountpoint -q /etc/pve; do
         sleep 1
         ((timeout--))
     done
     
-    if ! systemctl is-active --quiet pve-cluster; then
-        log "ERROR: pve-cluster failed to start"
-        return 1
+    if ! mountpoint -q /etc/pve; then
+        log "WARNING: /etc/pve is not mounted after starting pve-cluster"
+        log "You may need to restart the node or manually fix the cluster filesystem"
+    else
+        log "/etc/pve filesystem is mounted and ready"
     fi
     
-    sleep 3
-    
     # Start other services
+    sleep 3
     local services=("pveproxy" "pvedaemon" "pvestatd")
     for service in "${services[@]}"; do
+        log "Starting $service..."
         systemctl start "$service"
-        sleep 1
-        if ! systemctl is-active --quiet "$service"; then
-            log "WARNING: $service may not have started properly"
-        else
+        sleep 2
+        if systemctl is-active --quiet "$service"; then
             log "$service started successfully"
+        else
+            log "WARNING: $service may not have started properly"
+            # Try once more
+            sleep 2
+            systemctl start "$service" 2>/dev/null || true
         fi
     done
 }
@@ -210,8 +270,14 @@ rollback() {
     log "ERROR DETECTED - Starting rollback procedure..."
     
     # Stop services first (ignore errors)
-    systemctl stop pveproxy pvedaemon pvestatd 2>/dev/null || true
+    systemctl stop pvestatd pvedaemon pveproxy 2>/dev/null || true
+    systemctl stop pve-cluster 2>/dev/null || true
     pkill -KILL pmxcfs 2>/dev/null || true
+    
+    # Clean up /etc/pve mount
+    if mountpoint -q /etc/pve 2>/dev/null; then
+        umount /etc/pve 2>/dev/null || umount -f /etc/pve 2>/dev/null || umount -l /etc/pve 2>/dev/null || true
+    fi
     
     # Restore hostname first if we have the old one
     if [[ -n "$old_hostname" ]]; then
@@ -262,6 +328,12 @@ rollback() {
     
     # Attempt to restart services
     log "Attempting to restart services..."
+    
+    # Clean up /etc/pve mount before starting
+    if mountpoint -q /etc/pve 2>/dev/null; then
+        umount /etc/pve 2>/dev/null || umount -f /etc/pve 2>/dev/null || umount -l /etc/pve 2>/dev/null || true
+    fi
+    
     systemctl start pve-cluster 2>/dev/null || true
     sleep 5
     systemctl start pveproxy pvedaemon pvestatd 2>/dev/null || true
