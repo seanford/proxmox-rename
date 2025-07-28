@@ -171,7 +171,126 @@ start_services_safely() {
     done
 }
 
-preflight_checks() {
+get_running_guests() {
+    local running_vms=()
+    local running_cts=()
+    
+    # Get running VMs
+    if command -v qm >/dev/null 2>&1; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && running_vms+=("$line")
+        done < <(qm list 2>/dev/null | awk 'NR>1 && $3=="running" {print $1}')
+    fi
+    
+    # Get running containers
+    if command -v pct >/dev/null 2>&1; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && running_cts+=("$line")
+        done < <(pct list 2>/dev/null | awk 'NR>1 && $2=="running" {print $1}')
+    fi
+    
+    echo "${#running_vms[@]} ${#running_cts[@]}"
+    for vm in "${running_vms[@]}"; do
+        echo "vm:$vm"
+    done
+    for ct in "${running_cts[@]}"; do
+        echo "ct:$ct"
+    done
+}
+
+stop_all_guests() {
+    log "Stopping all running VMs and containers..."
+    local stopped_guests=()
+    
+    # Stop VMs
+    if command -v qm >/dev/null 2>&1; then
+        local running_vms=($(qm list 2>/dev/null | awk 'NR>1 && $3=="running" {print $1}'))
+        for vmid in "${running_vms[@]}"; do
+            log "Stopping VM $vmid..."
+            if qm stop "$vmid" >/dev/null 2>&1; then
+                stopped_guests+=("vm:$vmid")
+                log "VM $vmid stopped successfully"
+            else
+                log "WARNING: Failed to stop VM $vmid gracefully, trying shutdown..."
+                qm shutdown "$vmid" >/dev/null 2>&1 || true
+                stopped_guests+=("vm:$vmid")
+            fi
+        done
+    fi
+    
+    # Stop containers
+    if command -v pct >/dev/null 2>&1; then
+        local running_cts=($(pct list 2>/dev/null | awk 'NR>1 && $2=="running" {print $1}'))
+        for ctid in "${running_cts[@]}"; do
+            log "Stopping container $ctid..."
+            if pct stop "$ctid" >/dev/null 2>&1; then
+                stopped_guests+=("ct:$ctid")
+                log "Container $ctid stopped successfully"
+            else
+                log "WARNING: Failed to stop container $ctid gracefully"
+                stopped_guests+=("ct:$ctid")
+            fi
+        done
+    fi
+    
+    # Wait for all guests to stop
+    log "Waiting for all guests to fully stop..."
+    sleep 10
+    
+    # Save list of stopped guests for later restart
+    printf "%s\n" "${stopped_guests[@]}" > "$backup_dir/stopped_guests.list"
+    log "Saved list of stopped guests: ${#stopped_guests[@]} total"
+}
+
+start_previously_running_guests() {
+    local guests_file="$backup_dir/stopped_guests.list"
+    
+    if [[ ! -f "$guests_file" ]]; then
+        log "No previously running guests to restart"
+        return 0
+    fi
+    
+    log "Starting previously running guests..."
+    local started_count=0
+    local failed_count=0
+    
+    while IFS= read -r guest; do
+        [[ -z "$guest" ]] && continue
+        
+        local type="${guest%:*}"
+        local id="${guest#*:}"
+        
+        if [[ "$type" == "vm" ]]; then
+            log "Starting VM $id..."
+            if qm start "$id" >/dev/null 2>&1; then
+                log "VM $id started successfully"
+                ((started_count++))
+            else
+                log "ERROR: Failed to start VM $id"
+                ((failed_count++))
+            fi
+        elif [[ "$type" == "ct" ]]; then
+            log "Starting container $id..."
+            if pct start "$id" >/dev/null 2>&1; then
+                log "Container $id started successfully"
+                ((started_count++))
+            else
+                log "ERROR: Failed to start container $id"
+                ((failed_count++))
+            fi
+        fi
+        
+        # Small delay between starts
+        sleep 2
+    done < "$guests_file"
+    
+    log "Guest restart summary: $started_count started, $failed_count failed"
+    
+    if [[ $failed_count -gt 0 ]]; then
+        echo "WARNING: $failed_count guests failed to start automatically"
+        echo "You may need to start them manually through the web interface"
+    fi
+}
     log "Running preflight checks..."
     
     # Check if running as root
@@ -665,6 +784,9 @@ if verify_completion; then
         echo "- Remove and re-add this node to the cluster"
         echo "- Update cluster configuration on other nodes"
     fi
+    
+    # Start previously running guests
+    start_previously_running_guests
     
     echo ""
     echo "Rename operation completed successfully!"
