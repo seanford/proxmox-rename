@@ -225,9 +225,15 @@ rollback() {
         log "Restored /etc/hosts"
     fi
     
-    if [[ -f "$backup_dir/corosync.conf" ]]; then
-        cp "$backup_dir/corosync.conf" /etc/pve/corosync.conf
-        log "Restored corosync.conf"
+    if [[ -f "$corosync_backup" ]]; then
+        # Determine correct location for corosync.conf
+        if [[ -f "/etc/pve/corosync.conf" ]] || [[ "$corosync_conf" == "/etc/pve/corosync.conf" ]]; then
+            cp "$corosync_backup" /etc/pve/corosync.conf
+            log "Restored corosync.conf to /etc/pve/"
+        elif [[ -f "/etc/corosync/corosync.conf" ]] || [[ "$corosync_conf" == "/etc/corosync/corosync.conf" ]]; then
+            cp "$corosync_backup" /etc/corosync/corosync.conf
+            log "Restored corosync.conf to /etc/corosync/"
+        fi
     fi
     
     if [[ -f "$backup_dir/storage.cfg" ]]; then
@@ -281,7 +287,10 @@ preflight_checks
 # --- Step 0: Cluster Detection and Warning ---
 clustered=false
 corosync_conf="/etc/pve/corosync.conf"
-if [[ -f "$corosync_conf" ]]; then
+corosync_backup="$backup_dir/corosync.conf"
+
+# Check multiple indicators for clustering
+if [[ -f "$corosync_conf" ]] || [[ -f "/etc/corosync/corosync.conf" ]] || [[ -d "/etc/pve/nodes" && $(ls -1 /etc/pve/nodes/ 2>/dev/null | wc -l) -gt 1 ]]; then
     clustered=true
     echo ""
     echo "========================================="
@@ -380,7 +389,15 @@ cp -a /etc/pve/nodes "$backup_dir/nodes"
 cp /etc/hosts "$backup_dir/hosts"
 
 [[ -f /etc/pve/storage.cfg ]] && cp /etc/pve/storage.cfg "$backup_dir/storage.cfg"
-[[ -f "$corosync_conf" ]] && cp "$corosync_conf" "$backup_dir/corosync.conf"
+# Backup corosync.conf if it exists (check both locations)
+if [[ -f "$corosync_conf" ]]; then
+    cp "$corosync_conf" "$corosync_backup"
+    log "Backed up corosync.conf from /etc/pve/"
+elif [[ -f "/etc/corosync/corosync.conf" ]]; then
+    cp "/etc/corosync/corosync.conf" "$corosync_backup"
+    corosync_conf="/etc/corosync/corosync.conf"  # Update path for later use
+    log "Backed up corosync.conf from /etc/corosync/"
+fi
 
 # Backup VM and container configs specifically
 if [[ -d "/etc/pve/nodes/$old_hostname/qemu-server" ]]; then
@@ -455,21 +472,38 @@ if ! grep -q "^$ip_address.*$new_hostname" /etc/hosts; then
 fi
 
 # --- Step 7: Update corosync.conf if clustered ---
-if [[ "$clustered" == "true" ]]; then
+if [[ "$clustered" == "true" ]] && [[ -f "$corosync_backup" ]]; then
     log "Updating cluster configuration..."
     
-    # Update hostname references
-    sed -i "s/\b$old_hostname\b/$new_hostname/g" "$corosync_conf"
+    # Work with the backed up copy first, then restore it
+    temp_corosync=$(mktemp)
+    cp "$corosync_backup" "$temp_corosync"
+    
+    # Update hostname references in temp file
+    sed -i "s/\b$old_hostname\b/$new_hostname/g" "$temp_corosync"
     
     # Increment version number
-    current_version=$(grep -E '^\s*version:' "$corosync_conf" | awk '{print $2}')
+    current_version=$(grep -E '^\s*version:' "$temp_corosync" | awk '{print $2}')
     if [[ -n "$current_version" ]] && [[ "$current_version" =~ ^[0-9]+$ ]]; then
         new_version=$((current_version + 1))
-        sed -i "s/^\(\s*version:\s*\)$current_version/\1$new_version/" "$corosync_conf"
+        sed -i "s/^\(\s*version:\s*\)$current_version/\1$new_version/" "$temp_corosync"
         log "Updated corosync.conf version: $current_version -> $new_version"
     else
         log "WARNING: Could not update corosync.conf version automatically"
     fi
+    
+    # Copy the updated file back to the correct location
+    if [[ -f "/etc/pve/corosync.conf" ]] || [[ "$corosync_conf" == "/etc/pve/corosync.conf" ]]; then
+        cp "$temp_corosync" "/etc/pve/corosync.conf"
+        log "Updated /etc/pve/corosync.conf"
+    elif [[ -f "/etc/corosync/corosync.conf" ]] || [[ "$corosync_conf" == "/etc/corosync/corosync.conf" ]]; then
+        cp "$temp_corosync" "/etc/corosync/corosync.conf"
+        log "Updated /etc/corosync/corosync.conf"
+    fi
+    
+    rm -f "$temp_corosync"
+elif [[ "$clustered" == "true" ]]; then
+    log "WARNING: Cluster detected but no corosync.conf found to update"
 fi
 
 # --- Step 8: Migrate RRD Data ---
