@@ -7,183 +7,576 @@ backup_dir="/root/pve_rollback_backup_$timestamp"
 rollback_log="$backup_dir/rollback.log"
 mkdir -p "$backup_dir"
 
-# --- Rollback Function ---
-rollback() {
-    echo "Error detected. Rolling back changes..."
-    # Restore /etc/hosts
-    if [ -f "$backup_dir/hosts" ]; then
-        cp "$backup_dir/hosts" /etc/hosts
-        echo "Restored /etc/hosts"
-    fi
+# --- Utility Functions ---
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$rollback_log"
+}
 
-    # Restore /etc/pve/nodes
-    if [ -d "$backup_dir/nodes" ]; then
-        rm -rf /etc/pve/nodes
-        cp -a "$backup_dir/nodes" /etc/pve/nodes
-        echo "Restored /etc/pve/nodes"
+validate_hostname() {
+    local hostname="$1"
+    if [[ ! "$hostname" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
+        echo "Error: Invalid hostname format. Use only letters, numbers, and hyphens."
+        return 1
     fi
+    if [[ ${#hostname} -gt 63 ]]; then
+        echo "Error: Hostname too long (max 63 characters)"
+        return 1
+    fi
+    if [[ "$hostname" =~ ^- ]] || [[ "$hostname" =~ -$ ]]; then
+        echo "Error: Hostname cannot start or end with hyphen"
+        return 1
+    fi
+}
 
-    # Restore VM and LXC configs
-    if [ -d "$backup_dir/qemu-server" ]; then
-        rm -rf /etc/pve/nodes/$new_hostname/qemu-server
-        cp -a "$backup_dir/qemu-server" /etc/pve/nodes/$old_hostname/
-        echo "Restored VM configs"
+get_primary_ip() {
+    # Try to get IP from default route interface
+    local default_iface=$(ip route | awk '/default/ {print $5; exit}')
+    if [[ -n "$default_iface" ]]; then
+        local ip=$(ip -4 addr show "$default_iface" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+        if [[ -n "$ip" ]]; then
+            echo "$ip"
+            return 0
+        fi
     fi
-    if [ -d "$backup_dir/lxc" ]; then
-        rm -rf /etc/pve/nodes/$new_hostname/lxc
-        cp -a "$backup_dir/lxc" /etc/pve/nodes/$old_hostname/
-        echo "Restored LXC configs"
-    fi
+    
+    # Fallback to first non-loopback IP
+    ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -n 1
+}
 
-    # Restore storage.cfg
-    if [ -f "$backup_dir/storage.cfg" ]; then
-        cp "$backup_dir/storage.cfg" /etc/pve/storage.cfg
-        echo "Restored storage.cfg"
-    fi
-
-    # Restore corosync.conf
-    if [ -f "$backup_dir/corosync.conf" ]; then
-        cp "$backup_dir/corosync.conf" /etc/pve/corosync.conf
-        echo "Restored corosync.conf"
-    fi
-
-    # Restore /var/lib/rrdcached dirs
-    for rrd_dir in node storage vm; do
-        base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
-        if [ -d "$backup_dir/pve2-$rrd_dir-$old_hostname" ]; then
-            rm -rf "$base_path/$new_hostname"
-            mv "$backup_dir/pve2-$rrd_dir-$old_hostname" "$base_path/$old_hostname"
-            echo "Restored $base_path/$old_hostname"
+stop_services_safely() {
+    log "Stopping Proxmox services..."
+    local services=("pvestatd" "pvedaemon" "pveproxy" "pve-cluster")
+    
+    for service in "${services[@]}"; do
+        if systemctl is-active --quiet "$service"; then
+            log "Stopping $service..."
+            systemctl stop "$service"
+            
+            # Wait for service to actually stop
+            local timeout=30
+            while systemctl is-active --quiet "$service" && [ $timeout -gt 0 ]; do
+                sleep 1
+                ((timeout--))
+            done
+            
+            if systemctl is-active --quiet "$service"; then
+                log "ERROR: Failed to stop $service after 30 seconds"
+                return 1
+            fi
+            log "$service stopped successfully"
         fi
     done
+    
+    # Gracefully stop pmxcfs
+    if pgrep pmxcfs > /dev/null; then
+        log "Stopping pmxcfs..."
+        pkill -TERM pmxcfs
+        sleep 5
+        if pgrep pmxcfs > /dev/null; then
+            log "Force killing pmxcfs..."
+            pkill -KILL pmxcfs
+            sleep 2
+        fi
+    fi
+}
 
-    echo "Rollback complete. Please check your system."
+start_services_safely() {
+    log "Starting Proxmox services..."
+    
+    # Start cluster service first
+    systemctl start pve-cluster
+    local timeout=30
+    while ! systemctl is-active --quiet pve-cluster && [ $timeout -gt 0 ]; do
+        sleep 1
+        ((timeout--))
+    done
+    
+    if ! systemctl is-active --quiet pve-cluster; then
+        log "ERROR: pve-cluster failed to start"
+        return 1
+    fi
+    
+    sleep 3
+    
+    # Start other services
+    local services=("pveproxy" "pvedaemon" "pvestatd")
+    for service in "${services[@]}"; do
+        systemctl start "$service"
+        sleep 1
+        if ! systemctl is-active --quiet "$service"; then
+            log "WARNING: $service may not have started properly"
+        else
+            log "$service started successfully"
+        fi
+    done
+}
+
+preflight_checks() {
+    log "Running preflight checks..."
+    
+    # Check if running as root
+    if [[ $EUID -ne 0 ]]; then
+        echo "Error: Script must be run as root"
+        exit 1
+    fi
+    
+    # Check if Proxmox is installed
+    if [[ ! -d "/etc/pve" ]]; then
+        echo "Error: Proxmox VE not detected"
+        exit 1
+    fi
+    
+    # Check available disk space (need space for backups)
+    local available=$(df /root | awk 'NR==2 {print $4}')
+    local needed=1000000  # 1GB minimum
+    if [[ -d "/etc/pve" ]]; then
+        needed=$(du -s /etc/pve /var/lib/rrdcached 2>/dev/null | awk '{sum+=$1} END {print sum*3}' || echo 1000000)
+    fi
+    
+    if [[ $available -lt $needed ]]; then
+        echo "Error: Insufficient disk space. Need at least $(( needed / 1024 ))MB available in /root"
+        exit 1
+    fi
+    
+    # Check for running VMs/containers
+    local running_vms=0
+    local running_cts=0
+    
+    if command -v qm >/dev/null 2>&1; then
+        running_vms=$(qm list 2>/dev/null | awk 'NR>1 && $3=="running" {count++} END {print count+0}')
+    fi
+    
+    if command -v pct >/dev/null 2>&1; then
+        running_cts=$(pct list 2>/dev/null | awk 'NR>1 && $2=="running" {count++} END {print count+0}')
+    fi
+    
+    if [[ $running_vms -gt 0 ]] || [[ $running_cts -gt 0 ]]; then
+        echo "WARNING: Found $running_vms running VMs and $running_cts running containers"
+        echo "It's recommended to stop all VMs and containers before renaming"
+        read -p "Continue anyway? (yes/NO): " confirm
+        if [[ "$confirm" != "yes" ]]; then
+            echo "Aborting as requested"
+            exit 1
+        fi
+    fi
+    
+    log "Preflight checks completed"
+}
+
+verify_completion() {
+    log "Verifying rename completion..."
+    
+    # Check hostname
+    local current_hostname=$(hostname)
+    if [[ "$current_hostname" != "$new_hostname" ]]; then
+        log "ERROR: Hostname verification failed. Expected: $new_hostname, Got: $current_hostname"
+        return 1
+    fi
+    
+    # Check node directory exists
+    if [[ ! -d "/etc/pve/nodes/$new_hostname" ]]; then
+        log "ERROR: New node directory /etc/pve/nodes/$new_hostname not found"
+        return 1
+    fi
+    
+    # Check old directory is gone
+    if [[ -d "/etc/pve/nodes/$old_hostname" ]]; then
+        log "WARNING: Old node directory still exists"
+    fi
+    
+    # Check services are running
+    local services=("pveproxy" "pvedaemon" "pvestatd" "pve-cluster")
+    local failed_services=0
+    
+    for service in "${services[@]}"; do
+        if ! systemctl is-active --quiet "$service"; then
+            log "WARNING: Service $service is not running"
+            ((failed_services++))
+        fi
+    done
+    
+    if [[ $failed_services -eq 0 ]]; then
+        log "All services are running correctly"
+    else
+        log "WARNING: $failed_services services are not running properly"
+    fi
+    
+    log "Verification completed"
+    return 0
+}
+
+# --- Enhanced Rollback Function ---
+rollback() {
+    log "ERROR DETECTED - Starting rollback procedure..."
+    
+    # Stop services first (ignore errors)
+    systemctl stop pveproxy pvedaemon pvestatd 2>/dev/null || true
+    pkill -KILL pmxcfs 2>/dev/null || true
+    
+    # Restore hostname first if we have the old one
+    if [[ -n "$old_hostname" ]]; then
+        log "Restoring hostname to $old_hostname"
+        hostnamectl set-hostname "$old_hostname" 2>/dev/null || true
+    fi
+    
+    # Restore files in reverse order of modification
+    if [[ -f "$backup_dir/hosts" ]]; then
+        cp "$backup_dir/hosts" /etc/hosts
+        log "Restored /etc/hosts"
+    fi
+    
+    if [[ -f "$backup_dir/corosync.conf" ]]; then
+        cp "$backup_dir/corosync.conf" /etc/pve/corosync.conf
+        log "Restored corosync.conf"
+    fi
+    
+    if [[ -f "$backup_dir/storage.cfg" ]]; then
+        cp "$backup_dir/storage.cfg" /etc/pve/storage.cfg
+        log "Restored storage.cfg"
+    fi
+    
+    # Restore directory structures
+    if [[ -d "$backup_dir/nodes" ]]; then
+        rm -rf /etc/pve/nodes
+        cp -a "$backup_dir/nodes" /etc/pve/nodes
+        log "Restored /etc/pve/nodes"
+    fi
+    
+    # Restore RRD data
+    for rrd_dir in node storage vm; do
+        base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
+        if [[ -d "$backup_dir/pve2-$rrd_dir-$old_hostname" ]]; then
+            if [[ -d "$base_path/$new_hostname" ]]; then
+                rm -rf "$base_path/$new_hostname"
+            fi
+            mv "$backup_dir/pve2-$rrd_dir-$old_hostname" "$base_path/$old_hostname" 2>/dev/null || true
+            log "Restored RRD data for $rrd_dir"
+        fi
+    done
+    
+    # Attempt to restart services
+    log "Attempting to restart services..."
+    systemctl start pve-cluster 2>/dev/null || true
+    sleep 5
+    systemctl start pveproxy pvedaemon pvestatd 2>/dev/null || true
+    
+    log "ROLLBACK COMPLETE - System restored to previous state"
+    log "Backup files preserved in: $backup_dir"
+    echo ""
+    echo "ROLLBACK COMPLETED"
+    echo "Your system has been restored to its previous state."
+    echo "Backup files are preserved in: $backup_dir"
+    echo "Please verify your system is working correctly."
     exit 1
 }
 
+# Set up error trap
 trap rollback ERR
+
+# --- Main Script Execution ---
+
+# Run preflight checks
+preflight_checks
 
 # --- Step 0: Cluster Detection and Warning ---
 clustered=false
 corosync_conf="/etc/pve/corosync.conf"
-if [ -f "$corosync_conf" ]; then
+if [[ -f "$corosync_conf" ]]; then
     clustered=true
-    echo "WARNING: This node appears to be part of a Proxmox cluster!"
-    echo "Renaming a clustered Proxmox node can cause cluster instability."
-    echo "It is recommended to remove the node from the cluster, perform the rename, and re-join."
-    echo "Proceeding may break your cluster configuration."
-    read -p "Are you sure you want to proceed? (yes/NO): " confirm_cluster
+    echo ""
+    echo "========================================="
+    echo "WARNING: CLUSTERED NODE DETECTED"
+    echo "========================================="
+    echo "This node appears to be part of a Proxmox cluster!"
+    echo "Renaming a clustered node can cause cluster instability."
+    echo ""
+    echo "RECOMMENDED PROCEDURE:"
+    echo "1. Remove this node from the cluster"
+    echo "2. Perform the hostname rename"
+    echo "3. Re-join the cluster with the new name"
+    echo ""
+    echo "Proceeding with this script may break your cluster!"
+    echo ""
+    read -p "Are you absolutely sure you want to proceed? (type 'yes' to continue): " confirm_cluster
     if [[ "$confirm_cluster" != "yes" ]]; then
         echo "Aborting script as requested."
         exit 1
     fi
+    echo ""
 fi
 
 # --- Step 1: User Input ---
-echo "Current node directories:"
-ls /etc/pve/nodes/
+echo "Current Proxmox node directories:"
+ls -la /etc/pve/nodes/ 2>/dev/null || echo "Unable to list node directories"
 echo ""
 
-read -p "Enter previous hostname (the one with your VMs): " old_hostname
-read -p "Enter new hostname: " new_hostname
+while true; do
+    read -p "Enter current hostname (the directory containing your VMs/CTs): " old_hostname
+    if [[ -z "$old_hostname" ]]; then
+        echo "Error: Hostname cannot be empty"
+        continue
+    fi
+    if [[ ! -d "/etc/pve/nodes/$old_hostname" ]]; then
+        echo "Error: Node directory '/etc/pve/nodes/$old_hostname' not found"
+        echo "Available directories:"
+        ls /etc/pve/nodes/ 2>/dev/null || echo "None found"
+        continue
+    fi
+    break
+done
 
-# Basic validation
-if [[ -z "$old_hostname" || -z "$new_hostname" ]]; then
-    echo "Error: Hostnames cannot be empty"
-    exit 1
+while true; do
+    read -p "Enter new hostname: " new_hostname
+    if [[ -z "$new_hostname" ]]; then
+        echo "Error: Hostname cannot be empty"
+        continue
+    fi
+    if ! validate_hostname "$new_hostname"; then
+        continue
+    fi
+    if [[ "$old_hostname" == "$new_hostname" ]]; then
+        echo "Error: New hostname must be different from current hostname"
+        continue
+    fi
+    if [[ -d "/etc/pve/nodes/$new_hostname" ]]; then
+        echo "Error: Node directory for '$new_hostname' already exists"
+        continue
+    fi
+    break
+done
+
+# Confirm the operation
+echo ""
+echo "========================================="
+echo "RENAME CONFIRMATION"
+echo "========================================="
+echo "Old hostname: $old_hostname"
+echo "New hostname: $new_hostname"
+echo "Clustered: $clustered"
+echo ""
+echo "This will:"
+echo "- Stop all Proxmox services temporarily"
+echo "- Change system hostname"
+echo "- Move all VM and container configurations"
+echo "- Update network configuration"
+echo "- Migrate monitoring data"
+if [[ "$clustered" == "true" ]]; then
+    echo "- Update cluster configuration"
 fi
-if ! [[ -d "/etc/pve/nodes/$old_hostname" ]]; then
-    echo "Error: Source node directory not found"
-    exit 1
+echo ""
+read -p "Proceed with rename? (type 'yes' to confirm): " final_confirm
+if [[ "$final_confirm" != "yes" ]]; then
+    echo "Operation cancelled"
+    exit 0
 fi
 
-# --- Step 2: Backup Critical Data (for Rollback) ---
+log "Starting Proxmox node rename: $old_hostname -> $new_hostname"
+
+# --- Step 2: Create Comprehensive Backup ---
+log "Creating backup of current configuration..."
+
+# Backup critical files and directories
 cp -a /etc/pve/nodes "$backup_dir/nodes"
 cp /etc/hosts "$backup_dir/hosts"
-[ -f /etc/pve/storage.cfg ] && cp /etc/pve/storage.cfg "$backup_dir/storage.cfg"
-[ -f "$corosync_conf" ] && cp "$corosync_conf" "$backup_dir/corosync.conf"
-[ -d "/etc/pve/nodes/$old_hostname/qemu-server" ] && cp -a "/etc/pve/nodes/$old_hostname/qemu-server" "$backup_dir/qemu-server"
-[ -d "/etc/pve/nodes/$old_hostname/lxc" ] && cp -a "/etc/pve/nodes/$old_hostname/lxc" "$backup_dir/lxc"
+
+[[ -f /etc/pve/storage.cfg ]] && cp /etc/pve/storage.cfg "$backup_dir/storage.cfg"
+[[ -f "$corosync_conf" ]] && cp "$corosync_conf" "$backup_dir/corosync.conf"
+
+# Backup VM and container configs specifically
+if [[ -d "/etc/pve/nodes/$old_hostname/qemu-server" ]]; then
+    cp -a "/etc/pve/nodes/$old_hostname/qemu-server" "$backup_dir/qemu-server"
+fi
+
+if [[ -d "/etc/pve/nodes/$old_hostname/lxc" ]]; then
+    cp -a "/etc/pve/nodes/$old_hostname/lxc" "$backup_dir/lxc"
+fi
+
+# Backup RRD monitoring data
 for rrd_dir in node storage vm; do
     base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
     src="$base_path/$old_hostname"
-    if [ -d "$src" ]; then
+    if [[ -d "$src" ]]; then
         cp -a "$src" "$backup_dir/pve2-$rrd_dir-$old_hostname"
+        log "Backed up RRD data: $rrd_dir"
     fi
 done
 
+log "Backup completed successfully"
+
 # --- Step 3: Stop Services ---
-systemctl stop pveproxy pve-cluster pvedaemon pvestatd
-killall pmxcfs 2>/dev/null
-sleep 2
+stop_services_safely
 
-# --- Step 4: Save VM and Container Configurations ---
+# --- Step 4: Save VM and Container Configurations to Temp ---
+log "Preparing VM and container configurations..."
 temp_dir=$(mktemp -d)
-trap "rm -rf $temp_dir" EXIT
-cp -r "/etc/pve/nodes/$old_hostname/qemu-server" "$temp_dir/" 2>/dev/null || true
-cp -r "/etc/pve/nodes/$old_hostname/lxc" "$temp_dir/" 2>/dev/null || true
+trap "rm -rf $temp_dir; rollback" ERR
 
-# --- Step 5: Update Hostname ---
-hostnamectl set-hostname "$new_hostname"
-cp /etc/hosts /etc/hosts.bak
-ip_address=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -n 1)
-sed -i "s/\b$old_hostname\b/$new_hostname/g" /etc/hosts
-if ! grep -q "$ip_address" /etc/hosts; then
-    echo "$ip_address $new_hostname $new_hostname.localdomain" >> /etc/hosts
+if [[ -d "/etc/pve/nodes/$old_hostname/qemu-server" ]]; then
+    cp -r "/etc/pve/nodes/$old_hostname/qemu-server" "$temp_dir/" 2>/dev/null || true
+    vm_count=$(ls -1 "/etc/pve/nodes/$old_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
+    log "Found $vm_count VM configurations"
 fi
 
-# --- Step 6: Edit corosync.conf if clustered ---
-if [ "$clustered" = true ]; then
+if [[ -d "/etc/pve/nodes/$old_hostname/lxc" ]]; then
+    cp -r "/etc/pve/nodes/$old_hostname/lxc" "$temp_dir/" 2>/dev/null || true
+    ct_count=$(ls -1 "/etc/pve/nodes/$old_hostname/lxc"/*.conf 2>/dev/null | wc -l)
+    log "Found $ct_count container configurations"
+fi
+
+# --- Step 5: Update Hostname ---
+log "Updating system hostname to $new_hostname"
+hostnamectl set-hostname "$new_hostname"
+
+# Verify hostname change
+new_hostname_check=$(hostname)
+if [[ "$new_hostname_check" != "$new_hostname" ]]; then
+    log "ERROR: Hostname change failed"
+    exit 1
+fi
+
+# --- Step 6: Update /etc/hosts ---
+log "Updating /etc/hosts"
+cp /etc/hosts /etc/hosts.bak
+
+# Get primary IP address
+ip_address=$(get_primary_ip)
+if [[ -z "$ip_address" ]]; then
+    log "WARNING: Could not detect primary IP address"
+    ip_address="127.0.1.1"  # Fallback
+fi
+
+# Update existing entries
+sed -i "s/\b$old_hostname\b/$new_hostname/g" /etc/hosts
+
+# Ensure new hostname entry exists
+if ! grep -q "^$ip_address.*$new_hostname" /etc/hosts; then
+    echo "$ip_address $new_hostname $new_hostname.localdomain" >> /etc/hosts
+    log "Added new hostname entry to /etc/hosts"
+fi
+
+# --- Step 7: Update corosync.conf if clustered ---
+if [[ "$clustered" == "true" ]]; then
+    log "Updating cluster configuration..."
+    
+    # Update hostname references
     sed -i "s/\b$old_hostname\b/$new_hostname/g" "$corosync_conf"
+    
+    # Increment version number
     current_version=$(grep -E '^\s*version:' "$corosync_conf" | awk '{print $2}')
-    if [[ -n "$current_version" ]]; then
+    if [[ -n "$current_version" ]] && [[ "$current_version" =~ ^[0-9]+$ ]]; then
         new_version=$((current_version + 1))
         sed -i "s/^\(\s*version:\s*\)$current_version/\1$new_version/" "$corosync_conf"
-        echo "corosync.conf version updated from $current_version to $new_version"
+        log "Updated corosync.conf version: $current_version -> $new_version"
     else
-        echo "WARNING: Could not find version line in corosync.conf. Please update it manually if needed."
+        log "WARNING: Could not update corosync.conf version automatically"
     fi
 fi
 
-# --- Step 7: Copy rrdcached data directories to new hostname and remove old ones ---
+# --- Step 8: Migrate RRD Data ---
+log "Migrating monitoring data..."
 for rrd_dir in node storage vm; do
     base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
     src="$base_path/$old_hostname"
     dst="$base_path/$new_hostname"
-    if [ -d "$src" ]; then
+    
+    if [[ -d "$src" ]]; then
         mkdir -p "$dst"
         cp -a "$src/." "$dst/"
         rm -rf "$src"
+        log "Migrated RRD data: $rrd_dir"
     fi
 done
 
-# --- Step 8: Clean Old Node Configuration ---
+# --- Step 9: Update Node Directory Structure ---
+log "Updating node directory structure..."
+
+# Remove old node directory
 rm -rf "/etc/pve/nodes/$old_hostname"
 
-# --- Step 9: Restore VM and Container Configurations ---
+# Create new node directory structure
 mkdir -p "/etc/pve/nodes/$new_hostname/qemu-server"
 mkdir -p "/etc/pve/nodes/$new_hostname/lxc"
-cp -r "$temp_dir/qemu-server/"* "/etc/pve/nodes/$new_hostname/qemu-server/" 2>/dev/null || true
-cp -r "$temp_dir/lxc/"* "/etc/pve/nodes/$new_hostname/lxc/" 2>/dev/null || true
 
-# --- Step 10: Restore Storage Configuration ---
-if [ -f "$backup_dir/storage.cfg" ]; then
-    cp "$backup_dir/storage.cfg" /etc/pve/
+# --- Step 10: Restore VM and Container Configurations ---
+log "Restoring VM and container configurations..."
+
+if [[ -d "$temp_dir/qemu-server" ]]; then
+    cp -r "$temp_dir/qemu-server/"* "/etc/pve/nodes/$new_hostname/qemu-server/" 2>/dev/null || true
+    restored_vms=$(ls -1 "/etc/pve/nodes/$new_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
+    log "Restored $restored_vms VM configurations"
 fi
 
-# --- Step 11: Start Services ---
-systemctl start pve-cluster
-sleep 3
-systemctl start pveproxy pvedaemon pvestatd
-
-# --- Step 12: Cleanup and Success ---
-trap - ERR
-rm -rf "$backup_dir"
-echo -e "\nFinal Verification:"
-echo "Hostname: $(hostname)"
-ls -l /etc/pve/nodes/
-[ -f /etc/pve/storage.cfg ] && cat /etc/pve/storage.cfg || echo "No storage configuration found."
-if [ "$clustered" = true ]; then
-    echo "!!! WARNING: Clustered node detected. corosync.conf has been updated, but manual cluster validation and possibly service restarts are required."
+if [[ -d "$temp_dir/lxc" ]]; then
+    cp -r "$temp_dir/lxc/"* "/etc/pve/nodes/$new_hostname/lxc/" 2>/dev/null || true
+    restored_cts=$(ls -1 "/etc/pve/nodes/$new_hostname/lxc"/*.conf 2>/dev/null | wc -l)
+    log "Restored $restored_cts container configurations"
 fi
-echo "Done!"
+
+# --- Step 11: Update Storage Configuration ---
+if [[ -f "/etc/pve/storage.cfg" ]]; then
+    log "Updating storage configuration references..."
+    # Update any hostname references in storage.cfg
+    sed -i "s/\b$old_hostname\b/$new_hostname/g" /etc/pve/storage.cfg
+fi
+
+# --- Step 12: Start Services ---
+start_services_safely
+
+# --- Step 13: Verify and Cleanup ---
+if verify_completion; then
+    # Only cleanup backup if verification succeeds
+    trap - ERR
+    rm -rf "$backup_dir"
+    rm -rf "$temp_dir"
+    
+    log "Proxmox node rename completed successfully!"
+    
+    echo ""
+    echo "========================================="
+    echo "RENAME COMPLETED SUCCESSFULLY"
+    echo "========================================="
+    echo "Old hostname: $old_hostname"
+    echo "New hostname: $new_hostname"
+    echo ""
+    echo "Final verification:"
+    echo "- Current hostname: $(hostname)"
+    echo "- Node directory: /etc/pve/nodes/$new_hostname"
+    echo "- VMs found: $(ls -1 /etc/pve/nodes/$new_hostname/qemu-server/*.conf 2>/dev/null | wc -l)"
+    echo "- Containers found: $(ls -1 /etc/pve/nodes/$new_hostname/lxc/*.conf 2>/dev/null | wc -l)"
+    
+    if [[ "$clustered" == "true" ]]; then
+        echo ""
+        echo "========================================="
+        echo "IMPORTANT: CLUSTER FOLLOW-UP REQUIRED"
+        echo "========================================="
+        echo "Your node was part of a cluster. You MUST:"
+        echo "1. Restart this node to ensure all changes take effect"
+        echo "2. Verify cluster status with: pvecm status"
+        echo "3. Check cluster logs for any issues"
+        echo "4. Restart cluster services on other nodes if needed"
+        echo ""
+        echo "If cluster issues persist, you may need to:"
+        echo "- Remove and re-add this node to the cluster"
+        echo "- Update cluster configuration on other nodes"
+    fi
+    
+    echo ""
+    echo "Rename operation completed successfully!"
+    
+else
+    log "Verification failed - leaving backup intact"
+    echo ""
+    echo "========================================="
+    echo "VERIFICATION FAILED"
+    echo "========================================="
+    echo "The rename appears to have completed but verification failed."
+    echo "Backup files are preserved in: $backup_dir"
+    echo "Please check the system manually and review the log."
+    echo ""
+    echo "You may need to:"
+    echo "1. Restart Proxmox services manually"
+    echo "2. Check system logs for errors"
+    echo "3. Verify VM and container accessibility"
+    
+    exit 1
+fi
