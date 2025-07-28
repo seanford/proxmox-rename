@@ -30,11 +30,11 @@ validate_hostname() {
 
 get_primary_ip() {
     # Try to get IP from default route interface
-    local default_iface=$(ip route | awk '/default/ {print $5; exit}')
+    default_iface=$(ip route | awk '/default/ {print $5; exit}')
     if [[ -n "$default_iface" ]]; then
-        local ip=$(ip -4 addr show "$default_iface" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
-        if [[ -n "$ip" ]]; then
-            echo "$ip"
+        ip_addr=$(ip -4 addr show "$default_iface" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+        if [[ -n "$ip_addr" ]]; then
+            echo "$ip_addr"
             return 0
         fi
     fi
@@ -45,7 +45,7 @@ get_primary_ip() {
 
 stop_services_safely() {
     log "Stopping Proxmox services..."
-    local services=("pvestatd" "pvedaemon" "pveproxy" "pve-cluster")
+    services=("pvestatd" "pvedaemon" "pveproxy" "pve-cluster")
     
     for service in "${services[@]}"; do
         if systemctl is-active --quiet "$service"; then
@@ -53,7 +53,7 @@ stop_services_safely() {
             systemctl stop "$service"
             
             # Wait for service to actually stop
-            local timeout=30
+            timeout=30
             while systemctl is-active --quiet "$service" && [ $timeout -gt 0 ]; do
                 sleep 1
                 ((timeout--))
@@ -109,8 +109,8 @@ start_services_safely() {
     
     # Start cluster service first with retries
     log "Starting pve-cluster service..."
-    local cluster_attempts=0
-    local max_attempts=3
+    cluster_attempts=0
+    max_attempts=3
     
     while [ $cluster_attempts -lt $max_attempts ]; do
         systemctl start pve-cluster
@@ -140,7 +140,7 @@ start_services_safely() {
     done
     
     # Wait for pmxcfs to be ready
-    local timeout=30
+    timeout=30
     while [ $timeout -gt 0 ] && ! mountpoint -q /etc/pve; do
         sleep 1
         ((timeout--))
@@ -155,7 +155,7 @@ start_services_safely() {
     
     # Start other services
     sleep 3
-    local services=("pveproxy" "pvedaemon" "pvestatd")
+    services=("pveproxy" "pvedaemon" "pvestatd")
     for service in "${services[@]}"; do
         log "Starting $service..."
         systemctl start "$service"
@@ -172,8 +172,8 @@ start_services_safely() {
 }
 
 get_running_guests() {
-    local running_vms=()
-    local running_cts=()
+    running_vms=()
+    running_cts=()
     
     # Get running VMs
     if command -v qm >/dev/null 2>&1; then
@@ -200,11 +200,11 @@ get_running_guests() {
 
 stop_all_guests() {
     log "Stopping all running VMs and containers..."
-    local stopped_guests=()
+    stopped_guests=()
     
     # Stop VMs
     if command -v qm >/dev/null 2>&1; then
-        local running_vms=($(qm list 2>/dev/null | awk 'NR>1 && $3=="running" {print $1}'))
+        running_vms=($(qm list 2>/dev/null | awk 'NR>1 && $3=="running" {print $1}'))
         for vmid in "${running_vms[@]}"; do
             log "Stopping VM $vmid..."
             if qm stop "$vmid" >/dev/null 2>&1; then
@@ -220,7 +220,7 @@ stop_all_guests() {
     
     # Stop containers
     if command -v pct >/dev/null 2>&1; then
-        local running_cts=($(pct list 2>/dev/null | awk 'NR>1 && $2=="running" {print $1}'))
+        running_cts=($(pct list 2>/dev/null | awk 'NR>1 && $2=="running" {print $1}'))
         for ctid in "${running_cts[@]}"; do
             log "Stopping container $ctid..."
             if pct stop "$ctid" >/dev/null 2>&1; then
@@ -243,7 +243,7 @@ stop_all_guests() {
 }
 
 start_previously_running_guests() {
-    local guests_file="$backup_dir/stopped_guests.list"
+    guests_file="$backup_dir/stopped_guests.list"
     
     if [[ ! -f "$guests_file" ]]; then
         log "No previously running guests to restart"
@@ -251,6 +251,46 @@ start_previously_running_guests() {
     fi
     
     log "Starting previously running guests..."
+    started_count=0
+    failed_count=0
+    
+    while IFS= read -r guest; do
+        [[ -z "$guest" ]] && continue
+        
+        type="${guest%:*}"
+        id="${guest#*:}"
+        
+        if [[ "$type" == "vm" ]]; then
+            log "Starting VM $id..."
+            if qm start "$id" >/dev/null 2>&1; then
+                log "VM $id started successfully"
+                ((started_count++))
+            else
+                log "ERROR: Failed to start VM $id"
+                ((failed_count++))
+            fi
+        elif [[ "$type" == "ct" ]]; then
+            log "Starting container $id..."
+            if pct start "$id" >/dev/null 2>&1; then
+                log "Container $id started successfully"
+                ((started_count++))
+            else
+                log "ERROR: Failed to start container $id"
+                ((failed_count++))
+            fi
+        fi
+        
+        # Small delay between starts
+        sleep 2
+    done < "$guests_file"
+    
+    log "Guest restart summary: $started_count started, $failed_count failed"
+    
+    if [[ $failed_count -gt 0 ]]; then
+        echo "WARNING: $failed_count guests failed to start automatically"
+        echo "You may need to start them manually through the web interface"
+    fi
+}
     local started_count=0
     local failed_count=0
     
@@ -346,7 +386,7 @@ verify_completion() {
     log "Verifying rename completion..."
     
     # Check hostname
-    local current_hostname=$(hostname)
+    current_hostname=$(hostname)
     if [[ "$current_hostname" != "$new_hostname" ]]; then
         log "ERROR: Hostname verification failed. Expected: $new_hostname, Got: $current_hostname"
         return 1
@@ -364,8 +404,8 @@ verify_completion() {
     fi
     
     # Check services are running
-    local services=("pveproxy" "pvedaemon" "pvestatd" "pve-cluster")
-    local failed_services=0
+    services=("pveproxy" "pvedaemon" "pvestatd" "pve-cluster")
+    failed_services=0
     
     for service in "${services[@]}"; do
         if ! systemctl is-active --quiet "$service"; then
