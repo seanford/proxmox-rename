@@ -6,7 +6,8 @@ readonly SCRIPT_VERSION="2.0.0-fixed"
 readonly timestamp=$(date +%Y%m%d_%H%M%S)
 readonly backup_dir="/root/pve_rollback_backup_$timestamp"
 readonly rollback_log="$backup_dir/rollback.log"
-readonly temp_dir=$(mktemp -d -m 700)
+readonly temp_dir=$(mktemp -d)
+chmod 700 "$temp_dir"
 
 # Configurable timeouts
 readonly SERVICE_STOP_TIMEOUT=${PVE_SERVICE_TIMEOUT:-60}
@@ -766,10 +767,10 @@ atomic_file_update() {
         echo "$temp_file"
     else
         # Read from stdin and write to temp file
-        cat > "$temp_file" || {
+        if ! cat > "$temp_file"; then
             rm -f "$temp_file"
             return 1
-        }
+        fi
         
         # Atomic move
         if mv "$temp_file" "$file_path"; then
@@ -1506,17 +1507,21 @@ migrate_rrd_data() {
                 if cp -a "$src/." "$dst/" 2>/dev/null; then
                     # Verify copy succeeded before removing source
                     if [[ -d "$dst" ]] && [[ "$(ls -A "$dst" 2>/dev/null)" ]]; then
-                        rm -rf "$src" 2>/dev/null || {
+                        if ! rm -rf "$src" 2>/dev/null; then
                             log_warn "Failed to remove old RRD directory for $rrd_dir"
-                        }
+                        fi
                         log_debug "Successfully migrated RRD data: $rrd_dir"
                     else
                         migration_errors+=("$rrd_dir: copy verification failed")
-                        rm -rf "$dst" 2>/dev/null || true
+                        if ! rm -rf "$dst" 2>/dev/null; then
+                            log_warn "Failed to cleanup after verification failure for $rrd_dir"
+                        fi
                     fi
                 else
                     migration_errors+=("$rrd_dir: copy failed")
-                    rm -rf "$dst" 2>/dev/null || true
+                    if ! rm -rf "$dst" 2>/dev/null; then
+                        log_warn "Failed to cleanup failed migration for $rrd_dir"
+                    fi
                 fi
             else
                 migration_errors+=("$rrd_dir: failed to create destination")
@@ -1717,9 +1722,9 @@ finalize_rename_operation() {
     if [[ ${#restart_needed[@]} -gt 0 ]]; then
         log_warn "Some services need restart: ${restart_needed[*]}"
         for service in "${restart_needed[@]}"; do
-            systemctl restart "$service" 2>/dev/null || {
+            if ! systemctl restart "$service" 2>/dev/null; then
                 log_warn "Failed to restart $service"
-            }
+            fi
         done
     fi
     
@@ -1727,7 +1732,9 @@ finalize_rename_operation() {
     trap - ERR
     
     # Clean up temporary files
-    rm -rf "$temp_dir" 2>/dev/null || true
+    if ! rm -rf "$temp_dir" 2>/dev/null; then
+        log_warn "Failed to cleanup temporary directory"
+    fi
     
     # Start previously running guests
     start_previously_running_guests
