@@ -41,8 +41,8 @@ mkdir -p "$backup_dir"
 # --- Enhanced Logging ---
 log() {
     local level="${2:-INFO}"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] [$level] $1" | tee -a "$rollback_log"
+    local log_timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$log_timestamp] [$level] $1" | tee -a "$rollback_log"
 }
 
 log_error() {
