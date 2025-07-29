@@ -1539,67 +1539,27 @@ complete_node_migration() {
     if [[ -d "/etc/pve/nodes/$old_hostname" ]]; then
         log "Found old node directory: $old_hostname"
         
-        # Check if new directory already exists
+        # Always check if new directory exists before attempting move
         if [[ -d "/etc/pve/nodes/$new_hostname" ]]; then
             log "New directory already exists, merging contents..."
-            
-            # Merge contents from old to new directory
-            if [[ -d "/etc/pve/nodes/$old_hostname/qemu-server" ]]; then
-                mkdir -p "/etc/pve/nodes/$new_hostname/qemu-server"
-                if cp -r "/etc/pve/nodes/$old_hostname/qemu-server/"* "/etc/pve/nodes/$new_hostname/qemu-server/" 2>/dev/null; then
-                    log_debug "Merged VM configurations"
-                else
-                    log_warn "No VM configurations to merge or merge failed"
-                fi
-            fi
-            
-            if [[ -d "/etc/pve/nodes/$old_hostname/lxc" ]]; then
-                mkdir -p "/etc/pve/nodes/$new_hostname/lxc"
-                if cp -r "/etc/pve/nodes/$old_hostname/lxc/"* "/etc/pve/nodes/$new_hostname/lxc/" 2>/dev/null; then
-                    log_debug "Merged container configurations"
-                else
-                    log_warn "No container configurations to merge or merge failed"
-                fi
-            fi
-            
-            # Copy any other files/directories that might exist
-            for item in "/etc/pve/nodes/$old_hostname/"*; do
-                if [[ -e "$item" ]]; then
-                    local basename_item
-                    basename_item=$(basename "$item")
-                    if [[ "$basename_item" != "qemu-server" && "$basename_item" != "lxc" ]]; then
-                        if cp -r "$item" "/etc/pve/nodes/$new_hostname/" 2>/dev/null; then
-                            log_debug "Copied additional item: $basename_item"
-                        else
-                            log_warn "Failed to copy item: $basename_item"
-                        fi
-                    fi
-                fi
-            done
-            
-            # Remove old directory after successful merge
-            if rm -rf "/etc/pve/nodes/$old_hostname" 2>/dev/null; then
-                log "Successfully merged and removed old node directory"
-            else
-                log_warn "Failed to remove old node directory after merge"
-            fi
+            merge_node_directories
         else
-            # New directory doesn't exist, safe to move
-            log "Moving node directory: $old_hostname -> $new_hostname"
-            if mv "/etc/pve/nodes/$old_hostname" "/etc/pve/nodes/$new_hostname"; then
+            log "New directory doesn't exist, attempting move..."
+            # Try to move, but if it fails, assume destination exists and merge
+            if mv "/etc/pve/nodes/$old_hostname" "/etc/pve/nodes/$new_hostname" 2>/dev/null; then
                 log "Node directory moved successfully"
             else
-                log_error "Failed to move node directory - attempting recovery"
-                create_new_node_directory
+                log_warn "Move failed (destination may exist), attempting merge..."
+                merge_node_directories
             fi
         fi
     else
-        # Old directory doesn't exist, check if new one exists
-        if [[ -d "/etc/pve/nodes/$new_hostname" ]]; then
-            log "New node directory already exists"
-        else
+        # Old directory doesn't exist, ensure new one exists
+        if [[ ! -d "/etc/pve/nodes/$new_hostname" ]]; then
             log "Creating new node directory structure"
             create_new_node_directory
+        else
+            log "New node directory already exists"
         fi
     fi
     
@@ -1622,6 +1582,66 @@ complete_node_migration() {
     fi
     
     log "Node directory migration completed: $vm_count VMs, $ct_count containers"
+}
+
+merge_node_directories() {
+    log "Merging node directories: $old_hostname -> $new_hostname"
+    
+    # Ensure new directory structure exists
+    mkdir -p "/etc/pve/nodes/$new_hostname/qemu-server"
+    mkdir -p "/etc/pve/nodes/$new_hostname/lxc"
+    
+    # Merge VM configurations
+    if [[ -d "/etc/pve/nodes/$old_hostname/qemu-server" ]]; then
+        local vm_files
+        vm_files=$(find "/etc/pve/nodes/$old_hostname/qemu-server" -name "*.conf" 2>/dev/null | wc -l)
+        if [[ $vm_files -gt 0 ]]; then
+            if cp -r "/etc/pve/nodes/$old_hostname/qemu-server/"* "/etc/pve/nodes/$new_hostname/qemu-server/" 2>/dev/null; then
+                log "Merged $vm_files VM configurations"
+            else
+                log_warn "Failed to merge VM configurations"
+            fi
+        else
+            log_debug "No VM configurations to merge"
+        fi
+    fi
+    
+    # Merge container configurations
+    if [[ -d "/etc/pve/nodes/$old_hostname/lxc" ]]; then
+        local ct_files
+        ct_files=$(find "/etc/pve/nodes/$old_hostname/lxc" -name "*.conf" 2>/dev/null | wc -l)
+        if [[ $ct_files -gt 0 ]]; then
+            if cp -r "/etc/pve/nodes/$old_hostname/lxc/"* "/etc/pve/nodes/$new_hostname/lxc/" 2>/dev/null; then
+                log "Merged $ct_files container configurations"
+            else
+                log_warn "Failed to merge container configurations"
+            fi
+        else
+            log_debug "No container configurations to merge"
+        fi
+    fi
+    
+    # Copy any other files/directories that might exist
+    for item in "/etc/pve/nodes/$old_hostname/"*; do
+        if [[ -e "$item" ]]; then
+            local basename_item
+            basename_item=$(basename "$item")
+            if [[ "$basename_item" != "qemu-server" && "$basename_item" != "lxc" ]]; then
+                if cp -r "$item" "/etc/pve/nodes/$new_hostname/" 2>/dev/null; then
+                    log_debug "Copied additional item: $basename_item"
+                else
+                    log_warn "Failed to copy item: $basename_item"
+                fi
+            fi
+        fi
+    done
+    
+    # Remove old directory after successful merge
+    if rm -rf "/etc/pve/nodes/$old_hostname" 2>/dev/null; then
+        log "Successfully merged and removed old node directory"
+    else
+        log_warn "Failed to remove old node directory after merge"
+    fi
 }
 
 cleanup_successful_operation() {
