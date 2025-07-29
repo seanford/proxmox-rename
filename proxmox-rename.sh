@@ -21,6 +21,7 @@ declare -g clustered=false
 declare -g corosync_conf=""
 declare -g corosync_backup=""
 declare -g rollback_in_progress=false
+declare -g debug_mode=${PVE_DEBUG:-false}
 
 # Ensure cleanup on exit
 cleanup() {
@@ -30,6 +31,10 @@ cleanup() {
     fi
     if [[ $exit_code -ne 0 && "$rollback_in_progress" != "true" ]]; then
         echo "Script failed with exit code $exit_code. Backup preserved in: $backup_dir"
+        if [[ "$debug_mode" == "true" ]]; then
+            echo "Debug mode: Last command that failed occurred around line $LINENO"
+            echo "Check log file: $rollback_log"
+        fi
     fi
     exit $exit_code
 }
@@ -54,7 +59,9 @@ log_warn() {
 }
 
 log_debug() {
-    log "$1" "DEBUG"
+    if [[ "$debug_mode" == "true" ]]; then
+        log "$1" "DEBUG"
+    fi
 }
 
 # --- Enhanced Validation Functions ---
@@ -704,7 +711,7 @@ update_hostname_in_file() {
     temp_file=$(atomic_file_update "$file_path")
     
     # Perform substitution with word boundaries to avoid partial matches
-    if sed "s/\b$old_name\b/$new_name/g" "$file_path" > "$temp_file"; then
+    if sed "s/\\b$old_name\\b/$new_name/g" "$file_path" > "$temp_file"; then
         if mv "$temp_file" "$file_path"; then
             log_debug "Successfully updated $file_path"
             return 0
@@ -722,17 +729,24 @@ check_cluster_health() {
     # Enhanced cluster detection
     local cluster_indicators=0
     
+    log_debug "Starting cluster health check..."
+    
     # Check for corosync configuration
     if [[ -f "/etc/pve/corosync.conf" ]] || [[ -f "/etc/corosync/corosync.conf" ]]; then
         ((cluster_indicators++))
+        log_debug "Found corosync configuration"
     fi
     
     # Check for multiple node directories
     if [[ -d "/etc/pve/nodes" ]]; then
         local node_count
-        node_count=$(find /etc/pve/nodes -maxdepth 1 -type d | wc -l)
-        if [[ $node_count -gt 2 ]]; then  # More than just the base dir and one node
-            ((cluster_indicators++))
+        if node_count=$(find /etc/pve/nodes -maxdepth 1 -type d 2>/dev/null | wc -l); then
+            if [[ $node_count -gt 2 ]]; then  # More than just the base dir and one node
+                ((cluster_indicators++))
+                log_debug "Found multiple node directories: $node_count"
+            fi
+        else
+            log_warn "Failed to count node directories"
         fi
     fi
     
@@ -740,6 +754,7 @@ check_cluster_health() {
     if systemctl is-active --quiet pve-cluster 2>/dev/null; then
         if pgrep -x pmxcfs >/dev/null 2>&1; then
             ((cluster_indicators++))
+            log_debug "Found running cluster services"
         fi
     fi
     
@@ -747,17 +762,18 @@ check_cluster_health() {
     if command -v pvecm >/dev/null 2>&1; then
         if pvecm status >/dev/null 2>&1; then
             ((cluster_indicators++))
+            log_debug "Cluster status command successful"
         fi
     fi
     
     if [[ $cluster_indicators -ge 2 ]]; then
         clustered=true
-        log "Cluster configuration detected"
-        return 0
+        log_debug "Cluster configuration detected with $cluster_indicators indicators"
+    else
+        clustered=false
+        log_debug "Single node configuration detected with $cluster_indicators indicators"
     fi
     
-    clustered=false
-    log "Single node configuration detected"
     return 0
 }
 
@@ -766,23 +782,28 @@ check_running_guests() {
     local running_cts=0
     
     if command -v qm >/dev/null 2>&1; then
-        running_vms=$(qm list 2>/dev/null | awk 'NR>1 && $3=="running" {count++} END {print count+0}')
+        running_vms=$(qm list 2>/dev/null | awk 'NR>1 && $3=="running" {count++} END {print count+0}' || echo "0")
     fi
     
     if command -v pct >/dev/null 2>&1; then
-        running_cts=$(pct list 2>/dev/null | awk 'NR>1 && $2=="running" {count++} END {print count+0}')
+        running_cts=$(pct list 2>/dev/null | awk 'NR>1 && $2=="running" {count++} END {print count+0}' || echo "0")
     fi
+    
+    log_debug "Found $running_vms running VMs and $running_cts running containers"
     
     if [[ $running_vms -gt 0 ]] || [[ $running_cts -gt 0 ]]; then
         echo "WARNING: Found $running_vms running VMs and $running_cts running containers"
         echo "It's strongly recommended to stop all VMs and containers before renaming"
         echo "The script can stop them automatically, but you may prefer to do it manually"
         echo ""
-        read -p "Continue with automatic guest shutdown? (yes/NO): " confirm
+        read -r -p "Continue with automatic guest shutdown? (yes/NO): " confirm
         if [[ "$confirm" != "yes" ]]; then
             echo "Please stop all guests manually and re-run the script"
             return 1
         fi
+        log "User confirmed automatic guest shutdown"
+    else
+        log_debug "No running guests found"
     fi
     
     return 0
@@ -1063,13 +1084,11 @@ perform_rollback() {
 }
 
 # Set up error trap for rollback
-trap perform_rollback ERR
+trap 'perform_rollback $LINENO' ERR
 
 # --- Main Script Functions ---
 detect_cluster_configuration() {
-    log "Detecting cluster configuration..."
-    
-    check_cluster_health
+    log "Processing cluster configuration..."
     
     if [[ "$clustered" == "true" ]]; then
         echo ""
@@ -1090,7 +1109,7 @@ detect_cluster_configuration() {
         echo "- Possible need to restart other cluster nodes"
         echo "- Potential for cluster split-brain scenarios"
         echo ""
-        read -p "Are you absolutely sure you want to proceed? (type 'yes' to continue): " confirm_cluster
+        read -r -p "Are you absolutely sure you want to proceed? (type 'yes' to continue): " confirm_cluster
         if [[ "$confirm_cluster" != "yes" ]]; then
             echo "Operation cancelled for safety. Consider the recommended procedure."
             exit 0
@@ -1098,7 +1117,7 @@ detect_cluster_configuration() {
         echo ""
         log "User confirmed cluster rename operation"
     else
-        log "Single node configuration confirmed"
+        log "Single node configuration confirmed - proceeding"
     fi
 }
 
@@ -1120,7 +1139,7 @@ get_user_input() {
     
     # Get current hostname with validation
     while true; do
-        read -p "Enter current hostname (the directory containing your VMs/CTs): " old_hostname
+        read -r -p "Enter current hostname (the directory containing your VMs/CTs): " old_hostname
         
         if [[ -z "$old_hostname" ]]; then
             echo "Error: Hostname cannot be empty"
@@ -1139,7 +1158,7 @@ get_user_input() {
         system_hostname=$(hostname)
         if [[ "$old_hostname" != "$system_hostname" ]]; then
             echo "WARNING: Entered hostname '$old_hostname' doesn't match system hostname '$system_hostname'"
-            read -p "Continue anyway? (yes/NO): " hostname_mismatch_confirm
+            read -r -p "Continue anyway? (yes/NO): " hostname_mismatch_confirm
             if [[ "$hostname_mismatch_confirm" != "yes" ]]; then
                 continue
             fi
@@ -1150,7 +1169,7 @@ get_user_input() {
     
     # Get new hostname with validation
     while true; do
-        read -p "Enter new hostname: " new_hostname
+        read -r -p "Enter new hostname: " new_hostname
         
         if [[ -z "$new_hostname" ]]; then
             echo "Error: Hostname cannot be empty"
@@ -1210,7 +1229,7 @@ confirm_operation() {
     echo "⚠️  IMPORTANT: This script includes automatic rollback on failure,"
     echo "   but you should have an independent backup strategy."
     echo ""
-    read -p "Proceed with the rename operation? (type 'CONFIRM' to proceed): " final_confirm
+    read -r -p "Proceed with the rename operation? (type 'CONFIRM' to proceed): " final_confirm
     
     if [[ "$final_confirm" != "CONFIRM" ]]; then
         echo "Operation cancelled by user"
@@ -1411,7 +1430,7 @@ update_cluster_configuration() {
     
     if [[ -n "$current_version" ]] && [[ "$current_version" =~ ^[0-9]+$ ]]; then
         local new_version=$((current_version + 1))
-        if sed -i "s/^\(\s*version:\s*\)$current_version/\1$new_version/" "$corosync_file"; then
+        if sed -i "s/^\\(\\s*version:\\s*\\)$current_version/\\1$new_version/" "$corosync_file"; then
             log "Updated corosync.conf version: $current_version -> $new_version"
         else
             log_warn "Failed to update corosync.conf version number"
@@ -1611,7 +1630,7 @@ cleanup_successful_operation() {
     fi
     
     echo ""
-    read -p "Keep backup files for safety? (Y/n): " keep_backup
+    read -r -p "Keep backup files for safety? (Y/n): " keep_backup
     if [[ "$keep_backup" =~ ^[Nn]$ ]]; then
         log "Removing backup directory as requested"
         if ! rm -rf "$backup_dir" 2>/dev/null; then
@@ -1689,7 +1708,7 @@ execute_rename_process() {
     guest_info=$(get_running_guests)
     local vm_count
     local ct_count
-    read vm_count ct_count <<< "$guest_info"
+    read -r vm_count ct_count <<< "$guest_info"
     
     if [[ $vm_count -gt 0 ]] || [[ $ct_count -gt 0 ]]; then
         log "Found $vm_count running VMs and $ct_count running containers"
