@@ -1506,22 +1506,8 @@ create_new_node_directory() {
         exit 1
     fi
     
-    # Restore configurations from temporary directory
-    if [[ -d "$temp_dir/qemu-server" ]]; then
-        if cp -r "$temp_dir/qemu-server/"* "/etc/pve/nodes/$new_hostname/qemu-server/" 2>/dev/null; then
-            local restored_vms
-            restored_vms=$(find "/etc/pve/nodes/$new_hostname/qemu-server" -name "*.conf" 2>/dev/null | wc -l)
-            log "Restored $restored_vms VM configurations"
-        fi
-    fi
-    
-    if [[ -d "$temp_dir/lxc" ]]; then
-        if cp -r "$temp_dir/lxc/"* "/etc/pve/nodes/$new_hostname/lxc/" 2>/dev/null; then
-            local restored_cts
-            restored_cts=$(find "/etc/pve/nodes/$new_hostname/lxc" -name "*.conf" 2>/dev/null | wc -l)
-            log "Restored $restored_cts container configurations"
-        fi
-    fi
+    # Restore configurations from backup (preferred) or temp directory (fallback)
+    restore_configurations_from_backup
     
     log "New node directory structure created and populated"
 }
@@ -1535,33 +1521,40 @@ complete_node_migration() {
         exit 1
     fi
     
-    # Check if old node directory still exists
+    # Remove old directory if it exists
     if [[ -d "/etc/pve/nodes/$old_hostname" ]]; then
-        log "Found old node directory: $old_hostname"
-        
-        # Always check if new directory exists before attempting move
-        if [[ -d "/etc/pve/nodes/$new_hostname" ]]; then
-            log "New directory already exists, merging contents..."
-            merge_node_directories
+        log "Removing old node directory: $old_hostname"
+        if rm -rf "/etc/pve/nodes/$old_hostname" 2>/dev/null; then
+            log "Old node directory removed successfully"
         else
-            log "New directory doesn't exist, attempting move..."
-            # Try to move, but if it fails, assume destination exists and merge
-            if mv "/etc/pve/nodes/$old_hostname" "/etc/pve/nodes/$new_hostname" 2>/dev/null; then
-                log "Node directory moved successfully"
-            else
-                log_warn "Move failed (destination may exist), attempting merge..."
-                merge_node_directories
-            fi
-        fi
-    else
-        # Old directory doesn't exist, ensure new one exists
-        if [[ ! -d "/etc/pve/nodes/$new_hostname" ]]; then
-            log "Creating new node directory structure"
-            create_new_node_directory
-        else
-            log "New node directory already exists"
+            log_warn "Failed to remove old node directory"
         fi
     fi
+    
+    # Remove new directory if it exists (in case it was created earlier but is incomplete)
+    if [[ -d "/etc/pve/nodes/$new_hostname" ]]; then
+        log "Removing incomplete new node directory to start fresh"
+        if rm -rf "/etc/pve/nodes/$new_hostname" 2>/dev/null; then
+            log "Incomplete new directory removed"
+        else
+            log_warn "Failed to remove incomplete new directory"
+        fi
+    fi
+    
+    # Create fresh new directory structure
+    log "Creating fresh node directory structure for $new_hostname"
+    if ! mkdir -p "/etc/pve/nodes/$new_hostname/qemu-server"; then
+        log_error "Failed to create VM configuration directory"
+        exit 1
+    fi
+    
+    if ! mkdir -p "/etc/pve/nodes/$new_hostname/lxc"; then
+        log_error "Failed to create container configuration directory"
+        exit 1
+    fi
+    
+    # Restore configurations from backup
+    restore_configurations_from_backup
     
     # Verify the new directory exists and has content
     if [[ ! -d "/etc/pve/nodes/$new_hostname" ]]; then
@@ -1569,7 +1562,7 @@ complete_node_migration() {
         exit 1
     fi
     
-    # Check if we have configurations in the new directory
+    # Check final counts
     local vm_count=0
     local ct_count=0
     
@@ -1584,64 +1577,112 @@ complete_node_migration() {
     log "Node directory migration completed: $vm_count VMs, $ct_count containers"
 }
 
-merge_node_directories() {
-    log "Merging node directories: $old_hostname -> $new_hostname"
+restore_configurations_from_backup() {
+    log "Restoring VM and container configurations from backup..."
     
-    # Ensure new directory structure exists
-    mkdir -p "/etc/pve/nodes/$new_hostname/qemu-server"
-    mkdir -p "/etc/pve/nodes/$new_hostname/lxc"
-    
-    # Merge VM configurations
-    if [[ -d "/etc/pve/nodes/$old_hostname/qemu-server" ]]; then
-        local vm_files
-        vm_files=$(find "/etc/pve/nodes/$old_hostname/qemu-server" -name "*.conf" 2>/dev/null | wc -l)
-        if [[ $vm_files -gt 0 ]]; then
-            if cp -r "/etc/pve/nodes/$old_hostname/qemu-server/"* "/etc/pve/nodes/$new_hostname/qemu-server/" 2>/dev/null; then
-                log "Merged $vm_files VM configurations"
-            else
-                log_warn "Failed to merge VM configurations"
-            fi
-        else
-            log_debug "No VM configurations to merge"
-        fi
+    # Debug: Show what's in the backup directory
+    log_debug "Backup directory contents:"
+    if [[ -d "$backup_dir" ]]; then
+        ls -la "$backup_dir" 2>/dev/null | while read -r line; do log_debug "  $line"; done
     fi
     
-    # Merge container configurations
-    if [[ -d "/etc/pve/nodes/$old_hostname/lxc" ]]; then
-        local ct_files
-        ct_files=$(find "/etc/pve/nodes/$old_hostname/lxc" -name "*.conf" 2>/dev/null | wc -l)
-        if [[ $ct_files -gt 0 ]]; then
-            if cp -r "/etc/pve/nodes/$old_hostname/lxc/"* "/etc/pve/nodes/$new_hostname/lxc/" 2>/dev/null; then
-                log "Merged $ct_files container configurations"
-            else
-                log_warn "Failed to merge container configurations"
-            fi
-        else
-            log_debug "No container configurations to merge"
-        fi
-    fi
+    local restored_vms=0
+    local restored_cts=0
     
-    # Copy any other files/directories that might exist
-    for item in "/etc/pve/nodes/$old_hostname/"*; do
-        if [[ -e "$item" ]]; then
-            local basename_item
-            basename_item=$(basename "$item")
-            if [[ "$basename_item" != "qemu-server" && "$basename_item" != "lxc" ]]; then
-                if cp -r "$item" "/etc/pve/nodes/$new_hostname/" 2>/dev/null; then
-                    log_debug "Copied additional item: $basename_item"
-                else
-                    log_warn "Failed to copy item: $basename_item"
+    # Restore VM configurations from backup
+    if [[ -d "$backup_dir/qemu-server" ]]; then
+        log_debug "Found VM backup directory, checking contents..."
+        local vm_configs
+        vm_configs=$(find "$backup_dir/qemu-server" -name "*.conf" 2>/dev/null)
+        if [[ -n "$vm_configs" ]]; then
+            log "Found VM configurations in backup, restoring..."
+            while IFS= read -r config_file; do
+                if [[ -f "$config_file" ]]; then
+                    local config_name
+                    config_name=$(basename "$config_file")
+                    if cp "$config_file" "/etc/pve/nodes/$new_hostname/qemu-server/$config_name" 2>/dev/null; then
+                        ((restored_vms++))
+                        log_debug "Restored VM config: $config_name"
+                    else
+                        log_warn "Failed to restore VM config: $config_name"
+                    fi
                 fi
-            fi
+            done <<< "$vm_configs"
+            log "Restored $restored_vms VM configurations from backup"
+        else
+            log_debug "No VM .conf files found in backup directory"
         fi
-    done
-    
-    # Remove old directory after successful merge
-    if rm -rf "/etc/pve/nodes/$old_hostname" 2>/dev/null; then
-        log "Successfully merged and removed old node directory"
     else
-        log_warn "Failed to remove old node directory after merge"
+        log_debug "No VM backup directory found at $backup_dir/qemu-server"
     fi
+    
+    # Restore container configurations from backup
+    if [[ -d "$backup_dir/lxc" ]]; then
+        log_debug "Found container backup directory, checking contents..."
+        local ct_configs
+        ct_configs=$(find "$backup_dir/lxc" -name "*.conf" 2>/dev/null)
+        if [[ -n "$ct_configs" ]]; then
+            log "Found container configurations in backup, restoring..."
+            while IFS= read -r config_file; do
+                if [[ -f "$config_file" ]]; then
+                    local config_name
+                    config_name=$(basename "$config_file")
+                    if cp "$config_file" "/etc/pve/nodes/$new_hostname/lxc/$config_name" 2>/dev/null; then
+                        ((restored_cts++))
+                        log_debug "Restored container config: $config_name"
+                    else
+                        log_warn "Failed to restore container config: $config_name"
+                    fi
+                fi
+            done <<< "$ct_configs"
+            log "Restored $restored_cts container configurations from backup"
+        else
+            log_debug "No container .conf files found in backup directory"
+        fi
+    else
+        log_debug "No container backup directory found at $backup_dir/lxc"
+    fi
+    
+    # Also try restoring from temp directory if available and backup had no configs
+    if [[ $restored_vms -eq 0 && -d "$temp_dir/qemu-server" ]]; then
+        log_debug "No VMs restored from backup, checking temp directory..."
+        local temp_vm_configs
+        temp_vm_configs=$(find "$temp_dir/qemu-server" -name "*.conf" 2>/dev/null)
+        if [[ -n "$temp_vm_configs" ]]; then
+            log "Found VM configurations in temp directory, restoring..."
+            while IFS= read -r config_file; do
+                if [[ -f "$config_file" ]]; then
+                    local config_name
+                    config_name=$(basename "$config_file")
+                    if cp "$config_file" "/etc/pve/nodes/$new_hostname/qemu-server/$config_name" 2>/dev/null; then
+                        ((restored_vms++))
+                        log_debug "Restored VM config from temp: $config_name"
+                    fi
+                fi
+            done <<< "$temp_vm_configs"
+        fi
+    fi
+    
+    if [[ $restored_cts -eq 0 && -d "$temp_dir/lxc" ]]; then
+        log_debug "No containers restored from backup, checking temp directory..."
+        local temp_ct_configs
+        temp_ct_configs=$(find "$temp_dir/lxc" -name "*.conf" 2>/dev/null)
+        if [[ -n "$temp_ct_configs" ]]; then
+            log "Found container configurations in temp directory, restoring..."
+            while IFS= read -r config_file; do
+                if [[ -f "$config_file" ]]; then
+                    local config_name
+                    config_name=$(basename "$config_file")
+                    if cp "$config_file" "/etc/pve/nodes/$new_hostname/lxc/$config_name" 2>/dev/null; then
+                        ((restored_cts++))
+                        log_debug "Restored container config from temp: $config_name"
+                    fi
+                fi
+            done <<< "$temp_ct_configs"
+        fi
+    fi
+    
+    log "Configuration restore completed: $restored_vms VMs, $restored_cts containers"
 }
 
 cleanup_successful_operation() {
