@@ -171,43 +171,6 @@ wait_for_service_state() {
     return 1
 }
 
-stop_services_safely() {
-    log "Stopping Proxmox services safely..."
-    local services=("pvestatd" "pvedaemon" "pveproxy" "pve-cluster")
-    local failed_services=()
-    
-    # Stop services in reverse dependency order
-    for service in "${services[@]}"; do
-        if systemctl is-active --quiet "$service" 2>/dev/null; then
-            log "Stopping $service..."
-            if systemctl stop "$service" 2>/dev/null; then
-                if wait_for_service_state "$service" "inactive" "$SERVICE_STOP_TIMEOUT"; then
-                    log "$service stopped successfully"
-                else
-                    log_warn "$service did not stop within timeout, forcing stop"
-                    systemctl kill "$service" 2>/dev/null || true
-                    failed_services+=("$service")
-                fi
-            else
-                log_error "Failed to stop $service"
-                failed_services+=("$service")
-            fi
-        else
-            log_debug "$service was not running"
-        fi
-    done
-    
-    # Handle pmxcfs specially
-    cleanup_pmxcfs
-    
-    if [[ ${#failed_services[@]} -gt 0 ]]; then
-        log_warn "Some services failed to stop cleanly: ${failed_services[*]}"
-        return 1
-    fi
-    
-    return 0
-}
-
 cleanup_pmxcfs() {
     log "Cleaning up pmxcfs and /etc/pve mount..."
     
@@ -256,58 +219,6 @@ cleanup_pmxcfs() {
     return 0
 }
 
-start_services_safely() {
-    log "Starting Proxmox services safely..."
-    
-    # Ensure clean slate
-    cleanup_pmxcfs
-    
-    # Clean cluster database
-    if [[ -d "/var/lib/pve-cluster" ]]; then
-        log "Cleaning cluster database..."
-        rm -rf /var/lib/pve-cluster/* 2>/dev/null || true
-    fi
-    
-    # Start cluster service with retries
-    start_cluster_service_with_retries
-    
-    # Wait for cluster filesystem to be ready
-    if ! wait_for_cluster_filesystem; then
-        log_error "Cluster filesystem failed to mount"
-        return 1
-    fi
-    
-    # Start other services
-    local services=("pveproxy" "pvedaemon" "pvestatd")
-    local failed_services=()
-    
-    for service in "${services[@]}"; do
-        log "Starting $service..."
-        if systemctl start "$service" 2>/dev/null; then
-            if wait_for_service_state "$service" "active" 30; then
-                log "$service started successfully"
-            else
-                log_warn "$service did not start properly, retrying once..."
-                systemctl restart "$service" 2>/dev/null || true
-                if wait_for_service_state "$service" "active" 15; then
-                    log "$service started on retry"
-                else
-                    failed_services+=("$service")
-                fi
-            fi
-        else
-            failed_services+=("$service")
-        fi
-    done
-    
-    if [[ ${#failed_services[@]} -gt 0 ]]; then
-        log_error "Failed to start services: ${failed_services[*]}"
-        return 1
-    fi
-    
-    return 0
-}
-
 start_cluster_service_with_retries() {
     log "Starting pve-cluster service with retries..."
     local max_attempts=3
@@ -350,105 +261,7 @@ wait_for_cluster_filesystem() {
     while [[ $timeout -gt 0 ]]; do
         if mountpoint -q /etc/pve 2>/dev/null; then
             # Additional check - try to access the filesystem
-            if [[ -d "/etc/pve/nodes/$new_hostname/lxc" ]]; then
-        ct_count=$(find "/etc/pve/nodes/$new_hostname/lxc" -name "*.conf" 2>/dev/null | wc -l)
-    fi
-    
-    echo "✓ VMs found: $vm_count"
-    echo "✓ Containers found: $ct_count"
-    
-    # Show cluster information if applicable
-    if [[ "$clustered" == "true" ]]; then
-        echo ""
-        echo "========================================="
-        echo "CLUSTER CONFIGURATION UPDATED"
-        echo "========================================="
-        echo "Your node was part of a cluster. Additional steps:"
-        echo ""
-        echo "1. VERIFY CLUSTER STATUS:"
-        echo "   Run: pvecm status"
-        echo "   Check: pvecm nodes"
-        echo ""
-        echo "2. MONITOR OTHER NODES:"
-        echo "   - Check cluster logs on other nodes"
-        echo "   - Verify they can see this renamed node"
-        echo "   - Restart cluster services if needed"
-        echo ""
-        echo "3. IF ISSUES OCCUR:"
-        echo "   - Check corosync.conf on all nodes"
-        echo "   - Verify network connectivity"
-        echo "   - Consider restarting cluster services"
-        echo ""
-        echo "⚠️  IMPORTANT: Monitor cluster health closely!"
-    fi
-    
-    echo ""
-    echo "========================================="
-    echo "NEXT STEPS"
-    echo "========================================="
-    echo "1. Test Proxmox web interface access"
-    echo "2. Verify all VMs and containers are visible"
-    echo "3. Check that monitoring data is preserved"
-    echo "4. Update any external references to the old hostname"
-    
-    if [[ "$clustered" == "true" ]]; then
-        echo "5. Verify cluster functionality across all nodes"
-        echo "6. Update cluster references in external systems"
-    fi
-    
-    echo ""
-    read -p "Keep backup files for safety? (Y/n): " keep_backup
-    if [[ "$keep_backup" =~ ^[Nn]$ ]]; then
-        log "Removing backup directory as requested"
-        if ! rm -rf "$backup_dir" 2>/dev/null; then
-            log_warn "Failed to remove backup directory"
-        fi
-        echo "Backup files removed."
-    else
-        echo "Backup files preserved in: $backup_dir"
-        echo "You can safely remove them after confirming everything works."
-    fi
-    
-    echo ""
-    echo "Hostname rename completed successfully!"
-    echo "Log file: $rollback_log"
-}
-
-# --- Main Script Execution ---
-main() {
-    echo "Proxmox VE Node Hostname Rename Script v$SCRIPT_VERSION"
-    echo "========================================================"
-    echo ""
-    
-    # Run preflight checks
-    if ! preflight_checks; then
-        echo "Preflight checks failed. Please resolve issues and try again."
-        exit 1
-    fi
-    
-    # Detect cluster configuration and warn user
-    detect_cluster_configuration
-    
-    # Get user input for hostnames
-    get_user_input
-    
-    # Final confirmation before proceeding
-    confirm_operation
-    
-    # Execute the rename process
-    execute_rename_process
-    
-    echo ""
-    echo "========================================="
-    echo "OPERATION COMPLETED SUCCESSFULLY"
-    echo "========================================="
-}
-
-# --- Script Entry Point ---
-# Ensure we're not being sourced
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
-finodes" ]] 2>/dev/null; then
+            if [[ -d "/etc/pve/nodes" ]]; then
                 log "/etc/pve filesystem is mounted and accessible"
                 return 0
             fi
@@ -459,6 +272,98 @@ finodes" ]] 2>/dev/null; then
     
     log_error "/etc/pve filesystem not ready after ${FILESYSTEM_MOUNT_TIMEOUT}s timeout"
     return 1
+}
+
+stop_services_safely() {
+    log "Stopping Proxmox services safely..."
+    local services=("pvestatd" "pvedaemon" "pveproxy" "pve-cluster")
+    local failed_services=()
+    
+    # Stop services in reverse dependency order
+    for service in "${services[@]}"; do
+        if systemctl is-active --quiet "$service" 2>/dev/null; then
+            log "Stopping $service..."
+            if systemctl stop "$service" 2>/dev/null; then
+                if wait_for_service_state "$service" "inactive" "$SERVICE_STOP_TIMEOUT"; then
+                    log "$service stopped successfully"
+                else
+                    log_warn "$service did not stop within timeout, forcing stop"
+                    systemctl kill "$service" 2>/dev/null || true
+                    failed_services+=("$service")
+                fi
+            else
+                log_error "Failed to stop $service"
+                failed_services+=("$service")
+            fi
+        else
+            log_debug "$service was not running"
+        fi
+    done
+    
+    # Handle pmxcfs specially
+    cleanup_pmxcfs
+    
+    if [[ ${#failed_services[@]} -gt 0 ]]; then
+        log_warn "Some services failed to stop cleanly: ${failed_services[*]}"
+        return 1
+    fi
+    
+    return 0
+}
+
+start_services_safely() {
+    log "Starting Proxmox services safely..."
+    
+    # Ensure clean slate
+    cleanup_pmxcfs
+    
+    # Clean cluster database
+    if [[ -d "/var/lib/pve-cluster" ]]; then
+        log "Cleaning cluster database..."
+        rm -rf /var/lib/pve-cluster/* 2>/dev/null || true
+    fi
+    
+    # Start cluster service with retries
+    if ! start_cluster_service_with_retries; then
+        log_error "Failed to start cluster service"
+        return 1
+    fi
+    
+    # Wait for cluster filesystem to be ready
+    if ! wait_for_cluster_filesystem; then
+        log_error "Cluster filesystem failed to mount"
+        return 1
+    fi
+    
+    # Start other services
+    local services=("pveproxy" "pvedaemon" "pvestatd")
+    local failed_services=()
+    
+    for service in "${services[@]}"; do
+        log "Starting $service..."
+        if systemctl start "$service" 2>/dev/null; then
+            if wait_for_service_state "$service" "active" 30; then
+                log "$service started successfully"
+            else
+                log_warn "$service did not start properly, retrying once..."
+                systemctl restart "$service" 2>/dev/null || true
+                if wait_for_service_state "$service" "active" 15; then
+                    log "$service started on retry"
+                else
+                    failed_services+=("$service")
+                fi
+            fi
+        else
+            failed_services+=("$service")
+        fi
+    done
+    
+    if [[ ${#failed_services[@]} -gt 0 ]]; then
+        log_error "Failed to start services: ${failed_services[*]}"
+        return 1
+    fi
+    
+    return 0
 }
 
 # --- Enhanced Guest Management ---
@@ -663,6 +568,34 @@ create_atomic_backup() {
     fi
 }
 
+backup_rrd_data() {
+    log "Backing up RRD monitoring data..."
+    local rrd_dirs=("node" "storage" "vm")
+    local failed_rrd=()
+    
+    for rrd_dir in "${rrd_dirs[@]}"; do
+        local base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
+        local src="$base_path/$old_hostname"
+        local dst="$backup_dir/pve2-$rrd_dir-$old_hostname"
+        
+        if [[ -d "$src" ]]; then
+            if create_atomic_backup "$src" "$dst"; then
+                log_debug "Backed up RRD data: $rrd_dir"
+            else
+                failed_rrd+=("$rrd_dir")
+                log_warn "Failed to backup RRD data: $rrd_dir"
+            fi
+        fi
+    done
+    
+    if [[ ${#failed_rrd[@]} -gt 0 ]]; then
+        log_warn "Some RRD backups failed: ${failed_rrd[*]}"
+        return 1
+    fi
+    
+    return 0
+}
+
 create_comprehensive_backup() {
     log "Creating comprehensive backup of current configuration..."
     
@@ -718,34 +651,6 @@ create_comprehensive_backup() {
     fi
     
     log "Backup completed successfully"
-    return 0
-}
-
-backup_rrd_data() {
-    log "Backing up RRD monitoring data..."
-    local rrd_dirs=("node" "storage" "vm")
-    local failed_rrd=()
-    
-    for rrd_dir in "${rrd_dirs[@]}"; do
-        local base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
-        local src="$base_path/$old_hostname"
-        local dst="$backup_dir/pve2-$rrd_dir-$old_hostname"
-        
-        if [[ -d "$src" ]]; then
-            if create_atomic_backup "$src" "$dst"; then
-                log_debug "Backed up RRD data: $rrd_dir"
-            else
-                failed_rrd+=("$rrd_dir")
-                log_warn "Failed to backup RRD data: $rrd_dir"
-            fi
-        fi
-    done
-    
-    if [[ ${#failed_rrd[@]} -gt 0 ]]; then
-        log_warn "Some RRD backups failed: ${failed_rrd[*]}"
-        return 1
-    fi
-    
     return 0
 }
 
@@ -813,68 +718,6 @@ update_hostname_in_file() {
 }
 
 # --- Enhanced System State Functions ---
-preflight_checks() {
-    log "Running comprehensive preflight checks..."
-    
-    # Basic system validation
-    if ! validate_system_state; then
-        return 1
-    fi
-    
-    # Check available disk space (need space for backups)
-    local available_kb
-    available_kb=$(df /root | awk 'NR==2 {print $4}')
-    local needed_kb=2000000  # 2GB minimum
-    
-    if [[ -d "/etc/pve" ]]; then
-        local pve_size
-        pve_size=$(du -sk /etc/pve /var/lib/rrdcached 2>/dev/null | awk '{sum+=$1} END {print sum*3}' || echo 1000000)
-        needed_kb=$((pve_size > needed_kb ? pve_size : needed_kb))
-    fi
-    
-    if [[ $available_kb -lt $needed_kb ]]; then
-        echo "Error: Insufficient disk space. Need at least $((needed_kb / 1024))MB available in /root"
-        echo "Available: $((available_kb / 1024))MB"
-        return 1
-    fi
-    
-    # Check for running VMs/containers and warn user
-    check_running_guests
-    
-    # Check cluster consistency
-    check_cluster_health
-    
-    log "Preflight checks completed successfully"
-    return 0
-}
-
-check_running_guests() {
-    local running_vms=0
-    local running_cts=0
-    
-    if command -v qm >/dev/null 2>&1; then
-        running_vms=$(qm list 2>/dev/null | awk 'NR>1 && $3=="running" {count++} END {print count+0}')
-    fi
-    
-    if command -v pct >/dev/null 2>&1; then
-        running_cts=$(pct list 2>/dev/null | awk 'NR>1 && $2=="running" {count++} END {print count+0}')
-    fi
-    
-    if [[ $running_vms -gt 0 ]] || [[ $running_cts -gt 0 ]]; then
-        echo "WARNING: Found $running_vms running VMs and $running_cts running containers"
-        echo "It's strongly recommended to stop all VMs and containers before renaming"
-        echo "The script can stop them automatically, but you may prefer to do it manually"
-        echo ""
-        read -p "Continue with automatic guest shutdown? (yes/NO): " confirm
-        if [[ "$confirm" != "yes" ]]; then
-            echo "Please stop all guests manually and re-run the script"
-            return 1
-        fi
-    fi
-    
-    return 0
-}
-
 check_cluster_health() {
     # Enhanced cluster detection
     local cluster_indicators=0
@@ -915,6 +758,68 @@ check_cluster_health() {
     
     clustered=false
     log "Single node configuration detected"
+    return 0
+}
+
+check_running_guests() {
+    local running_vms=0
+    local running_cts=0
+    
+    if command -v qm >/dev/null 2>&1; then
+        running_vms=$(qm list 2>/dev/null | awk 'NR>1 && $3=="running" {count++} END {print count+0}')
+    fi
+    
+    if command -v pct >/dev/null 2>&1; then
+        running_cts=$(pct list 2>/dev/null | awk 'NR>1 && $2=="running" {count++} END {print count+0}')
+    fi
+    
+    if [[ $running_vms -gt 0 ]] || [[ $running_cts -gt 0 ]]; then
+        echo "WARNING: Found $running_vms running VMs and $running_cts running containers"
+        echo "It's strongly recommended to stop all VMs and containers before renaming"
+        echo "The script can stop them automatically, but you may prefer to do it manually"
+        echo ""
+        read -p "Continue with automatic guest shutdown? (yes/NO): " confirm
+        if [[ "$confirm" != "yes" ]]; then
+            echo "Please stop all guests manually and re-run the script"
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+preflight_checks() {
+    log "Running comprehensive preflight checks..."
+    
+    # Basic system validation
+    if ! validate_system_state; then
+        return 1
+    fi
+    
+    # Check available disk space (need space for backups)
+    local available_kb
+    available_kb=$(df /root | awk 'NR==2 {print $4}')
+    local needed_kb=2000000  # 2GB minimum
+    
+    if [[ -d "/etc/pve" ]]; then
+        local pve_size
+        pve_size=$(du -sk /etc/pve /var/lib/rrdcached 2>/dev/null | awk '{sum+=$1} END {print sum*3}' || echo 1000000)
+        needed_kb=$((pve_size > needed_kb ? pve_size : needed_kb))
+    fi
+    
+    if [[ $available_kb -lt $needed_kb ]]; then
+        echo "Error: Insufficient disk space. Need at least $((needed_kb / 1024))MB available in /root"
+        echo "Available: $((available_kb / 1024))MB"
+        return 1
+    fi
+    
+    # Check for running VMs/containers and warn user
+    check_running_guests
+    
+    # Check cluster consistency
+    check_cluster_health
+    
+    log "Preflight checks completed successfully"
     return 0
 }
 
@@ -985,92 +890,6 @@ verify_completion() {
 }
 
 # --- Enhanced Rollback Function ---
-perform_rollback() {
-    rollback_in_progress=true
-    log_error "CRITICAL ERROR DETECTED - Starting comprehensive rollback procedure..."
-    
-    # Stop all services to ensure clean state
-    log "Stopping all Proxmox services for rollback..."
-    local services=("pvestatd" "pvedaemon" "pveproxy" "pve-cluster")
-    for service in "${services[@]}"; do
-        systemctl stop "$service" 2>/dev/null || true
-    done
-    
-    # Force cleanup of cluster filesystem
-    cleanup_pmxcfs
-    
-    # Clean up cluster database completely
-    if [[ -d "/var/lib/pve-cluster" ]]; then
-        log "Cleaning cluster database for rollback..."
-        rm -rf /var/lib/pve-cluster/* 2>/dev/null || true
-    fi
-    
-    # Restore system hostname first
-    if [[ -n "$old_hostname" ]]; then
-        log "Rolling back hostname to $old_hostname"
-        if ! hostnamectl set-hostname "$old_hostname" 2>/dev/null; then
-            echo "$old_hostname" > /etc/hostname 2>/dev/null || true
-        fi
-    fi
-    
-    # Restore critical files in dependency order
-    restore_backed_up_files
-    
-    # Restore RRD data before starting services
-    restore_rrd_data_rollback
-    
-    # Start cluster service to mount /etc/pve
-    log "Starting pve-cluster service for rollback..."
-    if ! start_cluster_service_with_retries; then
-        log_error "Failed to start cluster service during rollback"
-        log_error "Manual intervention may be required"
-    fi
-    
-    # Wait for filesystem to be ready
-    if wait_for_cluster_filesystem; then
-        log "/etc/pve mounted, restoring cluster configuration..."
-        
-        # Restore cluster files through mounted filesystem
-        restore_cluster_files_rollback
-        
-        # Wait for synchronization
-        log "Waiting for cluster synchronization during rollback..."
-        sleep 15
-        
-        # Restart cluster service to pick up restored configuration
-        systemctl restart pve-cluster 2>/dev/null || true
-        sleep 5
-    else
-        log_error "Could not mount /etc/pve during rollback - manual recovery required"
-    fi
-    
-    # Start remaining services
-    log "Starting remaining services..."
-    local remaining_services=("pveproxy" "pvedaemon" "pvestatd")
-    for service in "${remaining_services[@]}"; do
-        systemctl start "$service" 2>/dev/null || true
-        sleep 2
-    done
-    
-    log "ROLLBACK COMPLETE - System restored to previous state"
-    log "Backup files preserved in: $backup_dir"
-    echo ""
-    echo "============================================="
-    echo "ROLLBACK COMPLETED"
-    echo "============================================="
-    echo "Your system has been restored to its previous state."
-    echo "Backup files are preserved in: $backup_dir"
-    echo ""
-    echo "Please verify your system is working correctly:"
-    echo "1. Check Proxmox web interface accessibility"
-    echo "2. Verify VM and container visibility"
-    echo "3. Check cluster status if applicable"
-    echo "4. Review logs in $rollback_log"
-    echo ""
-    
-    exit 1
-}
-
 restore_backed_up_files() {
     log "Restoring backed up files..."
     
@@ -1155,6 +974,92 @@ restore_cluster_files_rollback() {
             fi
         fi
     fi
+}
+
+perform_rollback() {
+    rollback_in_progress=true
+    log_error "CRITICAL ERROR DETECTED - Starting comprehensive rollback procedure..."
+    
+    # Stop all services to ensure clean state
+    log "Stopping all Proxmox services for rollback..."
+    local services=("pvestatd" "pvedaemon" "pveproxy" "pve-cluster")
+    for service in "${services[@]}"; do
+        systemctl stop "$service" 2>/dev/null || true
+    done
+    
+    # Force cleanup of cluster filesystem
+    cleanup_pmxcfs
+    
+    # Clean up cluster database completely
+    if [[ -d "/var/lib/pve-cluster" ]]; then
+        log "Cleaning cluster database for rollback..."
+        rm -rf /var/lib/pve-cluster/* 2>/dev/null || true
+    fi
+    
+    # Restore system hostname first
+    if [[ -n "$old_hostname" ]]; then
+        log "Rolling back hostname to $old_hostname"
+        if ! hostnamectl set-hostname "$old_hostname" 2>/dev/null; then
+            echo "$old_hostname" > /etc/hostname 2>/dev/null || true
+        fi
+    fi
+    
+    # Restore critical files in dependency order
+    restore_backed_up_files
+    
+    # Restore RRD data before starting services
+    restore_rrd_data_rollback
+    
+    # Start cluster service to mount /etc/pve
+    log "Starting pve-cluster service for rollback..."
+    if ! start_cluster_service_with_retries; then
+        log_error "Failed to start cluster service during rollback"
+        log_error "Manual intervention may be required"
+    fi
+    
+    # Wait for filesystem to be ready
+    if wait_for_cluster_filesystem; then
+        log "/etc/pve mounted, restoring cluster configuration..."
+        
+        # Restore cluster files through mounted filesystem
+        restore_cluster_files_rollback
+        
+        # Wait for synchronization
+        log "Waiting for cluster synchronization during rollback..."
+        sleep 15
+        
+        # Restart cluster service to pick up restored configuration
+        systemctl restart pve-cluster 2>/dev/null || true
+        sleep 5
+    else
+        log_error "Could not mount /etc/pve during rollback - manual recovery required"
+    fi
+    
+    # Start remaining services
+    log "Starting remaining services..."
+    local remaining_services=("pveproxy" "pvedaemon" "pvestatd")
+    for service in "${remaining_services[@]}"; do
+        systemctl start "$service" 2>/dev/null || true
+        sleep 2
+    done
+    
+    log "ROLLBACK COMPLETE - System restored to previous state"
+    log "Backup files preserved in: $backup_dir"
+    echo ""
+    echo "============================================="
+    echo "ROLLBACK COMPLETED"
+    echo "============================================="
+    echo "Your system has been restored to its previous state."
+    echo "Backup files are preserved in: $backup_dir"
+    echo ""
+    echo "Please verify your system is working correctly:"
+    echo "1. Check Proxmox web interface accessibility"
+    echo "2. Verify VM and container visibility"
+    echo "3. Check cluster status if applicable"
+    echo "4. Review logs in $rollback_log"
+    echo ""
+    
+    exit 1
 }
 
 # Set up error trap for rollback
@@ -1316,69 +1221,6 @@ confirm_operation() {
 }
 
 # --- Core Rename Functions ---
-execute_rename_process() {
-    log "Starting Proxmox node rename process: $old_hostname -> $new_hostname"
-    
-    # Step 1: Create comprehensive backup
-    if ! create_comprehensive_backup; then
-        log_error "Backup creation failed - aborting operation"
-        exit 1
-    fi
-    
-    # Step 2: Stop all guests if any are running
-    local guest_info
-    guest_info=$(get_running_guests)
-    local vm_count
-    local ct_count
-    read vm_count ct_count <<< "$guest_info"
-    
-    if [[ $vm_count -gt 0 ]] || [[ $ct_count -gt 0 ]]; then
-        log "Found $vm_count running VMs and $ct_count running containers"
-        stop_all_guests
-    else
-        log "No running guests found"
-    fi
-    
-    # Step 3: Stop Proxmox services
-    if ! stop_services_safely; then
-        log_error "Failed to stop services safely"
-        exit 1
-    fi
-    
-    # Step 4: Save configurations to temporary location
-    prepare_configurations_for_move
-    
-    # Step 5: Update system hostname
-    update_system_hostname
-    
-    # Step 6: Update system configuration files
-    update_system_configuration
-    
-    # Step 7: Migrate RRD data
-    migrate_rrd_data
-    
-    # Step 8: Restart cluster service and update cluster configuration
-    restart_cluster_and_update_config
-    
-    # Step 9: Complete the node directory migration
-    complete_node_migration
-    
-    # Step 10: Start all services
-    if ! start_services_safely; then
-        log_error "Failed to start services - manual intervention may be required"
-        exit 1
-    fi
-    
-    # Step 11: Verify the operation completed successfully
-    if ! verify_completion; then
-        log_error "Rename verification failed"
-        exit 1
-    fi
-    
-    # Step 12: Clean up and restart guests
-    finalize_rename_operation
-}
-
 prepare_configurations_for_move() {
     log "Preparing VM and container configurations for migration..."
     
@@ -1429,16 +1271,6 @@ update_system_hostname() {
     log "System hostname successfully updated"
 }
 
-update_system_configuration() {
-    log "Updating system configuration files..."
-    
-    # Update /etc/hosts
-    update_hosts_file
-    
-    # Update any other system files that might reference the hostname
-    update_additional_system_files
-}
-
 update_hosts_file() {
     log "Updating /etc/hosts with new hostname"
     
@@ -1481,11 +1313,21 @@ update_additional_system_files() {
     for file in "${additional_files[@]}"; do
         if [[ -f "$file" ]]; then
             log_debug "Updating hostname references in $file"
-            update_hostname_in_file "$file" "$old_hostname" "$new_hostname" || {
+            if ! update_hostname_in_file "$file" "$old_hostname" "$new_hostname"; then
                 log_warn "Failed to update $file (non-critical)"
-            }
+            fi
         fi
     done
+}
+
+update_system_configuration() {
+    log "Updating system configuration files..."
+    
+    # Update /etc/hosts
+    update_hosts_file
+    
+    # Update any other system files that might reference the hostname
+    update_additional_system_files
 }
 
 migrate_rrd_data() {
@@ -1535,36 +1377,6 @@ migrate_rrd_data() {
     else
         log "RRD data migration completed successfully"
     fi
-}
-
-restart_cluster_and_update_config() {
-    log "Restarting cluster services and updating configuration..."
-    
-    # Clean cluster database to ensure fresh start
-    if [[ -d "/var/lib/pve-cluster" ]]; then
-        log "Cleaning cluster database for fresh start..."
-        rm -rf /var/lib/pve-cluster/* 2>/dev/null || true
-    fi
-    
-    # Start cluster service
-    if ! start_cluster_service_with_retries; then
-        log_error "Failed to start cluster service with new hostname"
-        exit 1
-    fi
-    
-    # Wait for cluster filesystem
-    if ! wait_for_cluster_filesystem; then
-        log_error "Cluster filesystem failed to mount with new hostname"
-        exit 1
-    fi
-    
-    # Update cluster configuration if needed
-    if [[ "$clustered" == "true" ]]; then
-        update_cluster_configuration
-    fi
-    
-    # Update storage configuration
-    update_storage_configuration
 }
 
 update_cluster_configuration() {
@@ -1631,6 +1443,70 @@ update_storage_configuration() {
     fi
 }
 
+restart_cluster_and_update_config() {
+    log "Restarting cluster services and updating configuration..."
+    
+    # Clean cluster database to ensure fresh start
+    if [[ -d "/var/lib/pve-cluster" ]]; then
+        log "Cleaning cluster database for fresh start..."
+        rm -rf /var/lib/pve-cluster/* 2>/dev/null || true
+    fi
+    
+    # Start cluster service
+    if ! start_cluster_service_with_retries; then
+        log_error "Failed to start cluster service with new hostname"
+        exit 1
+    fi
+    
+    # Wait for cluster filesystem
+    if ! wait_for_cluster_filesystem; then
+        log_error "Cluster filesystem failed to mount with new hostname"
+        exit 1
+    fi
+    
+    # Update cluster configuration if needed
+    if [[ "$clustered" == "true" ]]; then
+        update_cluster_configuration
+    fi
+    
+    # Update storage configuration
+    update_storage_configuration
+}
+
+create_new_node_directory() {
+    log "Creating new node directory structure..."
+    
+    # Create directory structure
+    if ! mkdir -p "/etc/pve/nodes/$new_hostname/qemu-server"; then
+        log_error "Failed to create VM configuration directory"
+        exit 1
+    fi
+    
+    if ! mkdir -p "/etc/pve/nodes/$new_hostname/lxc"; then
+        log_error "Failed to create container configuration directory"
+        exit 1
+    fi
+    
+    # Restore configurations from temporary directory
+    if [[ -d "$temp_dir/qemu-server" ]]; then
+        if cp -r "$temp_dir/qemu-server/"* "/etc/pve/nodes/$new_hostname/qemu-server/" 2>/dev/null; then
+            local restored_vms
+            restored_vms=$(find "/etc/pve/nodes/$new_hostname/qemu-server" -name "*.conf" 2>/dev/null | wc -l)
+            log "Restored $restored_vms VM configurations"
+        fi
+    fi
+    
+    if [[ -d "$temp_dir/lxc" ]]; then
+        if cp -r "$temp_dir/lxc/"* "/etc/pve/nodes/$new_hostname/lxc/" 2>/dev/null; then
+            local restored_cts
+            restored_cts=$(find "/etc/pve/nodes/$new_hostname/lxc" -name "*.conf" 2>/dev/null | wc -l)
+            log "Restored $restored_cts container configurations"
+        fi
+    fi
+    
+    log "New node directory structure created and populated"
+}
+
 complete_node_migration() {
     log "Completing node directory migration..."
     
@@ -1668,38 +1544,90 @@ complete_node_migration() {
     log "Node directory migration completed"
 }
 
-create_new_node_directory() {
-    log "Creating new node directory structure..."
+cleanup_successful_operation() {
+    echo ""
+    echo "========================================="
+    echo "RENAME COMPLETED SUCCESSFULLY!"
+    echo "========================================="
+    echo "Old hostname: $old_hostname"
+    echo "New hostname: $new_hostname"
+    echo ""
     
-    # Create directory structure
-    if ! mkdir -p "/etc/pve/nodes/$new_hostname/qemu-server"; then
-        log_error "Failed to create VM configuration directory"
-        exit 1
+    # Show verification information
+    echo "✓ Current hostname: $(hostname)"
+    echo "✓ Node directory: /etc/pve/nodes/$new_hostname"
+    
+    local vm_count=0
+    local ct_count=0
+    
+    if [[ -d "/etc/pve/nodes/$new_hostname/qemu-server" ]]; then
+        vm_count=$(find "/etc/pve/nodes/$new_hostname/qemu-server" -name "*.conf" 2>/dev/null | wc -l)
     fi
     
-    if ! mkdir -p "/etc/pve/nodes/$new_hostname/lxc"; then
-        log_error "Failed to create container configuration directory"
-        exit 1
+    if [[ -d "/etc/pve/nodes/$new_hostname/lxc" ]]; then
+        ct_count=$(find "/etc/pve/nodes/$new_hostname/lxc" -name "*.conf" 2>/dev/null | wc -l)
     fi
     
-    # Restore configurations from temporary directory
-    if [[ -d "$temp_dir/qemu-server" ]]; then
-        if cp -r "$temp_dir/qemu-server/"* "/etc/pve/nodes/$new_hostname/qemu-server/" 2>/dev/null; then
-            local restored_vms
-            restored_vms=$(find "/etc/pve/nodes/$new_hostname/qemu-server" -name "*.conf" 2>/dev/null | wc -l)
-            log "Restored $restored_vms VM configurations"
+    echo "✓ VMs found: $vm_count"
+    echo "✓ Containers found: $ct_count"
+    
+    # Show cluster information if applicable
+    if [[ "$clustered" == "true" ]]; then
+        echo ""
+        echo "========================================="
+        echo "CLUSTER CONFIGURATION UPDATED"
+        echo "========================================="
+        echo "Your node was part of a cluster. Additional steps:"
+        echo ""
+        echo "1. VERIFY CLUSTER STATUS:"
+        echo "   Run: pvecm status"
+        echo "   Check: pvecm nodes"
+        echo ""
+        echo "2. MONITOR OTHER NODES:"
+        echo "   - Check cluster logs on other nodes"
+        echo "   - Verify they can see this renamed node"
+        echo "   - Restart cluster services if needed"
+        echo ""
+        echo "3. IF ISSUES OCCUR:"
+        echo "   - Check corosync.conf on all nodes"
+        echo "   - Verify network connectivity"
+        echo "   - Consider restarting cluster services"
+        echo ""
+        echo "⚠️  IMPORTANT: Monitor cluster health closely!"
+    fi
+    
+    echo ""
+    echo "========================================="
+    echo "NEXT STEPS"
+    echo "========================================="
+    echo "1. Test Proxmox web interface access"
+    echo "2. Verify all VMs and containers are visible"
+    echo "3. Check that monitoring data is preserved"
+    echo "4. Update any external references to the old hostname"
+    
+    if [[ "$clustered" == "true" ]]; then
+        echo "5. Verify cluster functionality across all nodes"
+        echo "6. Update cluster references in external systems"
+    fi
+    
+    echo ""
+    read -p "Keep backup files for safety? (Y/n): " keep_backup
+    if [[ "$keep_backup" =~ ^[Nn]$ ]]; then
+        log "Removing backup directory as requested"
+        if ! rm -rf "$backup_dir" 2>/dev/null; then
+            log_warn "Failed to remove backup directory"
         fi
+        echo "Backup files removed."
+    else
+        echo "Backup files preserved in: $backup_dir"
+        echo "You can safely remove them after confirming everything works."
     fi
     
-    if [[ -d "$temp_dir/lxc" ]]; then
-        if cp -r "$temp_dir/lxc/"* "/etc/pve/nodes/$new_hostname/lxc/" 2>/dev/null; then
-            local restored_cts
-            restored_cts=$(find "/etc/pve/nodes/$new_hostname/lxc" -name "*.conf" 2>/dev/null | wc -l)
-            log "Restored $restored_cts container configurations"
-        fi
-    fi
+    echo ""
+    echo "Hostname rename completed successfully!"
+    echo "Log file: $rollback_log"
     
-    log "New node directory structure created and populated"
+    return 0
 }
 
 finalize_rename_operation() {
@@ -1747,24 +1675,101 @@ finalize_rename_operation() {
     log "Rename operation finalized successfully"
 }
 
-cleanup_successful_operation() {
-    echo ""
-    echo "========================================="
-    echo "RENAME COMPLETED SUCCESSFULLY!"
-    echo "========================================="
-    echo "Old hostname: $old_hostname"
-    echo "New hostname: $new_hostname"
-    echo ""
+execute_rename_process() {
+    log "Starting Proxmox node rename process: $old_hostname -> $new_hostname"
     
-    # Show verification information
-    echo "✓ Current hostname: $(hostname)"
-    echo "✓ Node directory: /etc/pve/nodes/$new_hostname"
-    
-    local vm_count=0
-    local ct_count=0
-    
-    if [[ -d "/etc/pve/nodes/$new_hostname/qemu-server" ]]; then
-        vm_count=$(find "/etc/pve/nodes/$new_hostname/qemu-server" -name "*.conf" 2>/dev/null | wc -l)
+    # Step 1: Create comprehensive backup
+    if ! create_comprehensive_backup; then
+        log_error "Backup creation failed - aborting operation"
+        exit 1
     fi
     
-    if [[ -d "/etc/pve/
+    # Step 2: Stop all guests if any are running
+    local guest_info
+    guest_info=$(get_running_guests)
+    local vm_count
+    local ct_count
+    read vm_count ct_count <<< "$guest_info"
+    
+    if [[ $vm_count -gt 0 ]] || [[ $ct_count -gt 0 ]]; then
+        log "Found $vm_count running VMs and $ct_count running containers"
+        stop_all_guests
+    else
+        log "No running guests found"
+    fi
+    
+    # Step 3: Stop Proxmox services
+    if ! stop_services_safely; then
+        log_error "Failed to stop services safely"
+        exit 1
+    fi
+    
+    # Step 4: Save configurations to temporary location
+    prepare_configurations_for_move
+    
+    # Step 5: Update system hostname
+    update_system_hostname
+    
+    # Step 6: Update system configuration files
+    update_system_configuration
+    
+    # Step 7: Migrate RRD data
+    migrate_rrd_data
+    
+    # Step 8: Restart cluster service and update cluster configuration
+    restart_cluster_and_update_config
+    
+    # Step 9: Complete the node directory migration
+    complete_node_migration
+    
+    # Step 10: Start all services
+    if ! start_services_safely; then
+        log_error "Failed to start services - manual intervention may be required"
+        exit 1
+    fi
+    
+    # Step 11: Verify the operation completed successfully
+    if ! verify_completion; then
+        log_error "Rename verification failed"
+        exit 1
+    fi
+    
+    # Step 12: Clean up and restart guests
+    finalize_rename_operation
+}
+
+# --- Main Script Execution ---
+main() {
+    echo "Proxmox VE Node Hostname Rename Script v$SCRIPT_VERSION"
+    echo "========================================================"
+    echo ""
+    
+    # Run preflight checks
+    if ! preflight_checks; then
+        echo "Preflight checks failed. Please resolve issues and try again."
+        exit 1
+    fi
+    
+    # Detect cluster configuration and warn user
+    detect_cluster_configuration
+    
+    # Get user input for hostnames
+    get_user_input
+    
+    # Final confirmation before proceeding
+    confirm_operation
+    
+    # Execute the rename process
+    execute_rename_process
+    
+    echo ""
+    echo "========================================="
+    echo "OPERATION COMPLETED SUCCESSFULLY"
+    echo "========================================="
+}
+
+# --- Script Entry Point ---
+# Ensure we're not being sourced
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
