@@ -400,6 +400,12 @@ rollback() {
         umount /etc/pve 2>/dev/null || umount -f /etc/pve 2>/dev/null || umount -l /etc/pve 2>/dev/null || true
     fi
     
+    # Clean up cluster database to allow service restart
+    if [[ -d "/var/lib/pve-cluster" ]]; then
+        log "Cleaning cluster database for rollback..."
+        rm -rf /var/lib/pve-cluster/*
+    fi
+    
     # Restore hostname first if we have the old one
     if [[ -n "$old_hostname" ]]; then
         log "Restoring hostname to $old_hostname"
@@ -412,51 +418,79 @@ rollback() {
         log "Restored /etc/hosts"
     fi
     
-    if [[ -f "$corosync_backup" ]]; then
-        # Determine correct location for corosync.conf
-        if [[ -f "/etc/pve/corosync.conf" ]] || [[ "$corosync_conf" == "/etc/pve/corosync.conf" ]]; then
-            cp "$corosync_backup" /etc/pve/corosync.conf
-            log "Restored corosync.conf to /etc/pve/"
-        elif [[ -f "/etc/corosync/corosync.conf" ]] || [[ "$corosync_conf" == "/etc/corosync/corosync.conf" ]]; then
-            cp "$corosync_backup" /etc/corosync/corosync.conf
-            log "Restored corosync.conf to /etc/corosync/"
-        fi
-    fi
-    
-    if [[ -f "$backup_dir/storage.cfg" ]]; then
-        cp "$backup_dir/storage.cfg" /etc/pve/storage.cfg
-        log "Restored storage.cfg"
-    fi
-    
-    # Restore directory structures
-    if [[ -d "$backup_dir/nodes" ]]; then
-        rm -rf /etc/pve/nodes
-        cp -a "$backup_dir/nodes" /etc/pve/nodes
-        log "Restored /etc/pve/nodes"
-    fi
-    
-    # Restore RRD data
+    # Restore RRD data before starting services
     for rrd_dir in node storage vm; do
         local base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
         if [[ -d "$backup_dir/pve2-$rrd_dir-$old_hostname" ]]; then
             if [[ -d "$base_path/$new_hostname" ]]; then
                 rm -rf "$base_path/$new_hostname"
             fi
-            mv "$backup_dir/pve2-$rrd_dir-$old_hostname" "$base_path/$old_hostname" 2>/dev/null || true
+            if [[ -d "$base_path/$old_hostname" ]]; then
+                rm -rf "$base_path/$old_hostname"
+            fi
+            cp -a "$backup_dir/pve2-$rrd_dir-$old_hostname" "$base_path/$old_hostname" 2>/dev/null || true
             log "Restored RRD data for $rrd_dir"
         fi
     done
     
-    # Attempt to restart services
-    log "Attempting to restart services..."
+    # Start cluster service to mount /etc/pve
+    log "Starting pve-cluster service for rollback..."
+    systemctl start pve-cluster 2>/dev/null || true
+    sleep 10
     
-    # Clean up /etc/pve mount before starting
-    if mountpoint -q /etc/pve 2>/dev/null; then
-        umount /etc/pve 2>/dev/null || umount -f /etc/pve 2>/dev/null || umount -l /etc/pve 2>/dev/null || true
+    # Wait for /etc/pve to be mounted
+    timeout=30
+    while [ $timeout -gt 0 ] && ! mountpoint -q /etc/pve; do
+        sleep 1
+        ((timeout--))
+    done
+    
+    if mountpoint -q /etc/pve; then
+        log "/etc/pve mounted, restoring cluster files..."
+        
+        # Restore corosync.conf through mounted filesystem
+        if [[ -f "$corosync_backup" ]]; then
+            if [[ -f "/etc/pve/corosync.conf" ]] || [[ "$corosync_conf" == "/etc/pve/corosync.conf" ]]; then
+                cp "$corosync_backup" /etc/pve/corosync.conf 2>/dev/null || true
+                log "Restored corosync.conf to /etc/pve/"
+            elif [[ -f "/etc/corosync/corosync.conf" ]] || [[ "$corosync_conf" == "/etc/corosync/corosync.conf" ]]; then
+                cp "$corosync_backup" /etc/corosync/corosync.conf 2>/dev/null || true
+                log "Restored corosync.conf to /etc/corosync/"
+            fi
+        fi
+        
+        # Restore storage.cfg through mounted filesystem
+        if [[ -f "$backup_dir/storage.cfg" ]]; then
+            cp "$backup_dir/storage.cfg" /etc/pve/storage.cfg 2>/dev/null || true
+            log "Restored storage.cfg"
+        fi
+        
+        # Restore directory structures through mounted filesystem
+        if [[ -d "$backup_dir/nodes" ]]; then
+            # Remove any new directories first
+            if [[ -d "/etc/pve/nodes/$new_hostname" ]]; then
+                rm -rf "/etc/pve/nodes/$new_hostname" 2>/dev/null || true
+            fi
+            
+            # Restore original nodes directory structure
+            rm -rf /etc/pve/nodes 2>/dev/null || true
+            cp -a "$backup_dir/nodes" /etc/pve/nodes 2>/dev/null || true
+            log "Restored /etc/pve/nodes"
+        fi
+        
+        # Wait for changes to sync
+        log "Waiting for cluster sync during rollback..."
+        sleep 10
+        
+        # Restart cluster service to pick up restored config
+        systemctl restart pve-cluster 2>/dev/null || true
+        sleep 5
+        
+    else
+        log "WARNING: Could not mount /etc/pve during rollback"
     fi
     
-    systemctl start pve-cluster 2>/dev/null || true
-    sleep 5
+    # Start other services
     systemctl start pveproxy pvedaemon pvestatd 2>/dev/null || true
     
     log "ROLLBACK COMPLETE - System restored to previous state"
@@ -603,8 +637,8 @@ fi
 
 # Backup RRD monitoring data
 for rrd_dir in node storage vm; do
-    local base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
-    local src="$base_path/$old_hostname"
+    base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
+    src="$base_path/$old_hostname"
     if [[ -d "$src" ]]; then
         cp -a "$src" "$backup_dir/pve2-$rrd_dir-$old_hostname"
         log "Backed up RRD data: $rrd_dir"
@@ -623,13 +657,13 @@ trap "rm -rf $temp_dir; rollback" ERR
 
 if [[ -d "/etc/pve/nodes/$old_hostname/qemu-server" ]]; then
     cp -r "/etc/pve/nodes/$old_hostname/qemu-server" "$temp_dir/" 2>/dev/null || true
-    local vm_count=$(ls -1 "/etc/pve/nodes/$old_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
+    vm_count=$(ls -1 "/etc/pve/nodes/$old_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
     log "Found $vm_count VM configurations"
 fi
 
 if [[ -d "/etc/pve/nodes/$old_hostname/lxc" ]]; then
     cp -r "/etc/pve/nodes/$old_hostname/lxc" "$temp_dir/" 2>/dev/null || true
-    local ct_count=$(ls -1 "/etc/pve/nodes/$old_hostname/lxc"/*.conf 2>/dev/null | wc -l)
+    ct_count=$(ls -1 "/etc/pve/nodes/$old_hostname/lxc"/*.conf 2>/dev/null | wc -l)
     log "Found $ct_count container configurations"
 fi
 
@@ -667,9 +701,9 @@ fi
 # --- Step 7: Migrate RRD Data ---
 log "Migrating monitoring data..."
 for rrd_dir in node storage vm; do
-    local base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
-    local src="$base_path/$old_hostname"
-    local dst="$base_path/$new_hostname"
+    base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
+    src="$base_path/$old_hostname"
+    dst="$base_path/$new_hostname"
     
     if [[ -d "$src" ]]; then
         mkdir -p "$dst"
@@ -691,8 +725,8 @@ fi
 
 # Start pve-cluster service first (this will recreate /etc/pve mount)
 log "Starting pve-cluster service with new hostname..."
-local cluster_attempts=0
-local max_attempts=3
+cluster_attempts=0
+max_attempts=3
 
 while [ $cluster_attempts -lt $max_attempts ]; do
     systemctl start pve-cluster
@@ -723,7 +757,7 @@ while [ $cluster_attempts -lt $max_attempts ]; do
 done
 
 # Wait for pmxcfs to be ready and /etc/pve to be mounted
-local timeout=30
+timeout=30
 while [ $timeout -gt 0 ] && ! mountpoint -q /etc/pve; do
     sleep 1
     ((timeout--))
@@ -750,9 +784,9 @@ if [[ "$clustered" == "true" ]] && [[ -f "$corosync_backup" ]]; then
         sed -i "s/\b$old_hostname\b/$new_hostname/g" /etc/pve/corosync.conf
         
         # Increment version number
-        local current_version=$(grep -E '^\s*version:' /etc/pve/corosync.conf | awk '{print $2}')
+        current_version=$(grep -E '^\s*version:' /etc/pve/corosync.conf | awk '{print $2}')
         if [[ -n "$current_version" ]] && [[ "$current_version" =~ ^[0-9]+$ ]]; then
-            local new_version=$((current_version + 1))
+            new_version=$((current_version + 1))
             sed -i "s/^\(\s*version:\s*\)$current_version/\1$new_version/" /etc/pve/corosync.conf
             log "Updated corosync.conf version: $current_version -> $new_version"
         else
@@ -766,9 +800,9 @@ if [[ "$clustered" == "true" ]] && [[ -f "$corosync_backup" ]]; then
         sed -i "s/\b$old_hostname\b/$new_hostname/g" /etc/corosync/corosync.conf
         
         # Increment version number
-        local current_version=$(grep -E '^\s*version:' /etc/corosync/corosync.conf | awk '{print $2}')
+        current_version=$(grep -E '^\s*version:' /etc/corosync/corosync.conf | awk '{print $2}')
         if [[ -n "$current_version" ]] && [[ "$current_version" =~ ^[0-9]+$ ]]; then
-            local new_version=$((current_version + 1))
+            new_version=$((current_version + 1))
             sed -i "s/^\(\s*version:\s*\)$current_version/\1$new_version/" /etc/corosync/corosync.conf
             log "Updated corosync.conf version: $current_version -> $new_version"
         fi
@@ -803,13 +837,13 @@ else
     # Restore VM and container configurations
     if [[ -d "$temp_dir/qemu-server" ]]; then
         cp -r "$temp_dir/qemu-server/"* "/etc/pve/nodes/$new_hostname/qemu-server/" 2>/dev/null || true
-        local restored_vms=$(ls -1 "/etc/pve/nodes/$new_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
+        restored_vms=$(ls -1 "/etc/pve/nodes/$new_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
         log "Restored $restored_vms VM configurations"
     fi
 
     if [[ -d "$temp_dir/lxc" ]]; then
         cp -r "$temp_dir/lxc/"* "/etc/pve/nodes/$new_hostname/lxc/" 2>/dev/null || true
-        local restored_cts=$(ls -1 "/etc/pve/nodes/$new_hostname/lxc"/*.conf 2>/dev/null | wc -l)
+        restored_cts=$(ls -1 "/etc/pve/nodes/$new_hostname/lxc"/*.conf 2>/dev/null | wc -l)
         log "Restored $restored_cts container configurations"
     fi
 fi
@@ -830,7 +864,7 @@ systemctl restart pve-cluster
 sleep 5
 
 # Wait for /etc/pve to be ready again
-local timeout=30
+timeout=30
 while [ $timeout -gt 0 ] && ! mountpoint -q /etc/pve; do
     sleep 1
     ((timeout--))
@@ -843,7 +877,7 @@ else
 fi
 
 # Start other services
-local services=("pveproxy" "pvedaemon" "pvestatd")
+services=("pveproxy" "pvedaemon" "pvestatd")
 for service in "${services[@]}"; do
     log "Starting $service..."
     systemctl start "$service"
