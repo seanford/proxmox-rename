@@ -399,9 +399,9 @@ wait_for_cluster_filesystem() {
     read -p "Keep backup files for safety? (Y/n): " keep_backup
     if [[ "$keep_backup" =~ ^[Nn]$ ]]; then
         log "Removing backup directory as requested"
-        rm -rf "$backup_dir" 2>/dev/null || {
+        if ! rm -rf "$backup_dir" 2>/dev/null; then
             log_warn "Failed to remove backup directory"
-        }
+        fi
         echo "Backup files removed."
     else
         echo "Backup files preserved in: $backup_dir"
@@ -1007,9 +1007,9 @@ perform_rollback() {
     # Restore system hostname first
     if [[ -n "$old_hostname" ]]; then
         log "Rolling back hostname to $old_hostname"
-        hostnamectl set-hostname "$old_hostname" 2>/dev/null || {
+        if ! hostnamectl set-hostname "$old_hostname" 2>/dev/null; then
             echo "$old_hostname" > /etc/hostname 2>/dev/null || true
-        }
+        fi
     fi
     
     # Restore critical files in dependency order
@@ -1411,10 +1411,10 @@ update_system_hostname() {
     # Update hostname using multiple methods for compatibility
     if ! hostnamectl set-hostname "$new_hostname" 2>/dev/null; then
         log_warn "hostnamectl failed, trying alternative method"
-        echo "$new_hostname" > /etc/hostname || {
+        if ! echo "$new_hostname" > /etc/hostname; then
             log_error "Failed to update /etc/hostname"
             exit 1
-        }
+        fi
     fi
     
     # Verify hostname change
@@ -1442,10 +1442,10 @@ update_hosts_file() {
     log "Updating /etc/hosts with new hostname"
     
     # Create backup of current hosts file
-    cp /etc/hosts /etc/hosts.pre-rename || {
+    if ! cp /etc/hosts /etc/hosts.pre-rename; then
         log_error "Failed to backup /etc/hosts"
         exit 1
-    }
+    fi
     
     # Get primary IP address
     local ip_address
@@ -1577,10 +1577,10 @@ update_cluster_configuration() {
     log "Updating $corosync_file..."
     
     # Create backup of current corosync.conf
-    cp "$corosync_file" "${corosync_file}.pre-rename" || {
+    if ! cp "$corosync_file" "${corosync_file}.pre-rename"; then
         log_error "Failed to backup corosync.conf"
         exit 1
-    }
+    fi
     
     # Update hostname references
     if ! update_hostname_in_file "$corosync_file" "$old_hostname" "$new_hostname"; then
@@ -1611,9 +1611,9 @@ update_storage_configuration() {
     
     if [[ -f "/etc/pve/storage.cfg" ]]; then
         # Create backup
-        cp "/etc/pve/storage.cfg" "/etc/pve/storage.cfg.pre-rename" || {
+        if ! cp "/etc/pve/storage.cfg" "/etc/pve/storage.cfg.pre-rename"; then
             log_warn "Failed to backup storage.cfg"
-        }
+        fi
         
         # Update hostname references
         if update_hostname_in_file "/etc/pve/storage.cfg" "$old_hostname" "$new_hostname"; then
@@ -1667,15 +1667,15 @@ create_new_node_directory() {
     log "Creating new node directory structure..."
     
     # Create directory structure
-    mkdir -p "/etc/pve/nodes/$new_hostname/qemu-server" || {
+    if ! mkdir -p "/etc/pve/nodes/$new_hostname/qemu-server"; then
         log_error "Failed to create VM configuration directory"
         exit 1
-    }
+    fi
     
-    mkdir -p "/etc/pve/nodes/$new_hostname/lxc" || {
+    if ! mkdir -p "/etc/pve/nodes/$new_hostname/lxc"; then
         log_error "Failed to create container configuration directory"
         exit 1
-    }
+    fi
     
     # Restore configurations from temporary directory
     if [[ -d "$temp_dir/qemu-server" ]]; then
@@ -1733,7 +1733,9 @@ finalize_rename_operation() {
     start_previously_running_guests
     
     # Remove backup if everything succeeded and user wants it removed
-    cleanup_successful_operation
+    if ! cleanup_successful_operation; then
+        log_warn "Cleanup had issues but rename succeeded"
+    fi
     
     log "Rename operation finalized successfully"
 }
