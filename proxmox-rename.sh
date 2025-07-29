@@ -1553,8 +1553,11 @@ complete_node_migration() {
         exit 1
     fi
     
-    # Restore configurations from backup
-    restore_configurations_from_backup
+    # Restore configurations from backup - this MUST succeed
+    if ! restore_configurations_from_backup; then
+        log_error "Failed to restore configurations from backup"
+        exit 1
+    fi
     
     # Verify the new directory exists and has content
     if [[ ! -d "/etc/pve/nodes/$new_hostname" ]]; then
@@ -1575,6 +1578,7 @@ complete_node_migration() {
     fi
     
     log "Node directory migration completed: $vm_count VMs, $ct_count containers"
+    return 0
 }
 
 restore_configurations_from_backup() {
@@ -1589,14 +1593,17 @@ restore_configurations_from_backup() {
     local restored_vms=0
     local restored_cts=0
     
-    # Restore VM configurations from backup
+    # Restore VM configurations from backup using array approach
     if [[ -d "$backup_dir/qemu-server" ]]; then
         log_debug "Found VM backup directory, checking contents..."
-        local vm_configs
-        vm_configs=$(find "$backup_dir/qemu-server" -name "*.conf" 2>/dev/null)
-        if [[ -n "$vm_configs" ]]; then
-            log "Found VM configurations in backup, restoring..."
-            while IFS= read -r config_file; do
+        local -a vm_config_files=()
+        while IFS= read -r -d '' config_file; do
+            vm_config_files+=("$config_file")
+        done < <(find "$backup_dir/qemu-server" -name "*.conf" -print0 2>/dev/null)
+        
+        if [[ ${#vm_config_files[@]} -gt 0 ]]; then
+            log "Found ${#vm_config_files[@]} VM configurations in backup, restoring..."
+            for config_file in "${vm_config_files[@]}"; do
                 if [[ -f "$config_file" ]]; then
                     local config_name
                     config_name=$(basename "$config_file")
@@ -1607,7 +1614,7 @@ restore_configurations_from_backup() {
                         log_warn "Failed to restore VM config: $config_name"
                     fi
                 fi
-            done <<< "$vm_configs"
+            done
             log "Restored $restored_vms VM configurations from backup"
         else
             log_debug "No VM .conf files found in backup directory"
@@ -1616,14 +1623,17 @@ restore_configurations_from_backup() {
         log_debug "No VM backup directory found at $backup_dir/qemu-server"
     fi
     
-    # Restore container configurations from backup
+    # Restore container configurations from backup using array approach
     if [[ -d "$backup_dir/lxc" ]]; then
         log_debug "Found container backup directory, checking contents..."
-        local ct_configs
-        ct_configs=$(find "$backup_dir/lxc" -name "*.conf" 2>/dev/null)
-        if [[ -n "$ct_configs" ]]; then
-            log "Found container configurations in backup, restoring..."
-            while IFS= read -r config_file; do
+        local -a ct_config_files=()
+        while IFS= read -r -d '' config_file; do
+            ct_config_files+=("$config_file")
+        done < <(find "$backup_dir/lxc" -name "*.conf" -print0 2>/dev/null)
+        
+        if [[ ${#ct_config_files[@]} -gt 0 ]]; then
+            log "Found ${#ct_config_files[@]} container configurations in backup, restoring..."
+            for config_file in "${ct_config_files[@]}"; do
                 if [[ -f "$config_file" ]]; then
                     local config_name
                     config_name=$(basename "$config_file")
@@ -1634,7 +1644,7 @@ restore_configurations_from_backup() {
                         log_warn "Failed to restore container config: $config_name"
                     fi
                 fi
-            done <<< "$ct_configs"
+            done
             log "Restored $restored_cts container configurations from backup"
         else
             log_debug "No container .conf files found in backup directory"
@@ -1646,11 +1656,14 @@ restore_configurations_from_backup() {
     # Also try restoring from temp directory if available and backup had no configs
     if [[ $restored_vms -eq 0 && -d "$temp_dir/qemu-server" ]]; then
         log_debug "No VMs restored from backup, checking temp directory..."
-        local temp_vm_configs
-        temp_vm_configs=$(find "$temp_dir/qemu-server" -name "*.conf" 2>/dev/null)
-        if [[ -n "$temp_vm_configs" ]]; then
-            log "Found VM configurations in temp directory, restoring..."
-            while IFS= read -r config_file; do
+        local -a temp_vm_files=()
+        while IFS= read -r -d '' config_file; do
+            temp_vm_files+=("$config_file")
+        done < <(find "$temp_dir/qemu-server" -name "*.conf" -print0 2>/dev/null)
+        
+        if [[ ${#temp_vm_files[@]} -gt 0 ]]; then
+            log "Found ${#temp_vm_files[@]} VM configurations in temp directory, restoring..."
+            for config_file in "${temp_vm_files[@]}"; do
                 if [[ -f "$config_file" ]]; then
                     local config_name
                     config_name=$(basename "$config_file")
@@ -1659,17 +1672,20 @@ restore_configurations_from_backup() {
                         log_debug "Restored VM config from temp: $config_name"
                     fi
                 fi
-            done <<< "$temp_vm_configs"
+            done
         fi
     fi
     
     if [[ $restored_cts -eq 0 && -d "$temp_dir/lxc" ]]; then
         log_debug "No containers restored from backup, checking temp directory..."
-        local temp_ct_configs
-        temp_ct_configs=$(find "$temp_dir/lxc" -name "*.conf" 2>/dev/null)
-        if [[ -n "$temp_ct_configs" ]]; then
-            log "Found container configurations in temp directory, restoring..."
-            while IFS= read -r config_file; do
+        local -a temp_ct_files=()
+        while IFS= read -r -d '' config_file; do
+            temp_ct_files+=("$config_file")
+        done < <(find "$temp_dir/lxc" -name "*.conf" -print0 2>/dev/null)
+        
+        if [[ ${#temp_ct_files[@]} -gt 0 ]]; then
+            log "Found ${#temp_ct_files[@]} container configurations in temp directory, restoring..."
+            for config_file in "${temp_ct_files[@]}"; do
                 if [[ -f "$config_file" ]]; then
                     local config_name
                     config_name=$(basename "$config_file")
@@ -1678,11 +1694,12 @@ restore_configurations_from_backup() {
                         log_debug "Restored container config from temp: $config_name"
                     fi
                 fi
-            done <<< "$temp_ct_configs"
+            done
         fi
     fi
     
     log "Configuration restore completed: $restored_vms VMs, $restored_cts containers"
+    return 0
 }
 
 cleanup_successful_operation() {
@@ -1797,9 +1814,6 @@ finalize_rename_operation() {
         done
     fi
     
-    # Disable error trap since we're about to clean up successfully
-    trap - ERR
-    
     # Clean up temporary files
     if ! rm -rf "$temp_dir" 2>/dev/null; then
         log_warn "Failed to cleanup temporary directory"
@@ -1814,6 +1828,9 @@ finalize_rename_operation() {
     fi
     
     log "Rename operation finalized successfully"
+    
+    # ONLY disable error trap at the very end after everything is successful
+    trap - ERR
 }
 
 execute_rename_process() {
@@ -1834,7 +1851,10 @@ execute_rename_process() {
     
     if [[ $vm_count -gt 0 ]] || [[ $ct_count -gt 0 ]]; then
         log "Found $vm_count running VMs and $ct_count running containers"
-        stop_all_guests
+        if ! stop_all_guests; then
+            log_error "Failed to stop guests - aborting operation"
+            exit 1
+        fi
     else
         log "No running guests found"
     fi
@@ -1846,22 +1866,40 @@ execute_rename_process() {
     fi
     
     # Step 4: Save configurations to temporary location
-    prepare_configurations_for_move
+    if ! prepare_configurations_for_move; then
+        log_error "Failed to prepare configurations"
+        exit 1
+    fi
     
     # Step 5: Update system hostname
-    update_system_hostname
+    if ! update_system_hostname; then
+        log_error "Failed to update system hostname"
+        exit 1
+    fi
     
     # Step 6: Update system configuration files
-    update_system_configuration
+    if ! update_system_configuration; then
+        log_error "Failed to update system configuration"
+        exit 1
+    fi
     
     # Step 7: Migrate RRD data
-    migrate_rrd_data
+    if ! migrate_rrd_data; then
+        log_error "Failed to migrate RRD data"
+        exit 1
+    fi
     
     # Step 8: Restart cluster service and update cluster configuration
-    restart_cluster_and_update_config
+    if ! restart_cluster_and_update_config; then
+        log_error "Failed to restart cluster and update config"
+        exit 1
+    fi
     
     # Step 9: Complete the node directory migration
-    complete_node_migration
+    if ! complete_node_migration; then
+        log_error "Failed to complete node migration"
+        exit 1
+    fi
     
     # Step 10: Start all services
     if ! start_services_safely; then
@@ -1875,8 +1913,11 @@ execute_rename_process() {
         exit 1
     fi
     
-    # Step 12: Clean up and restart guests
-    finalize_rename_operation
+    # Step 12: Clean up and restart guests (only if everything above succeeded)
+    if ! finalize_rename_operation; then
+        log_error "Failed to finalize rename operation"
+        exit 1
+    fi
 }
 
 # --- Main Script Execution ---
