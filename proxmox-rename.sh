@@ -603,8 +603,8 @@ fi
 
 # Backup RRD monitoring data
 for rrd_dir in node storage vm; do
-    local base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
-    local src="$base_path/$old_hostname"
+    base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
+    src="$base_path/$old_hostname"
     if [[ -d "$src" ]]; then
         cp -a "$src" "$backup_dir/pve2-$rrd_dir-$old_hostname"
         log "Backed up RRD data: $rrd_dir"
@@ -623,13 +623,13 @@ trap "rm -rf $temp_dir; rollback" ERR
 
 if [[ -d "/etc/pve/nodes/$old_hostname/qemu-server" ]]; then
     cp -r "/etc/pve/nodes/$old_hostname/qemu-server" "$temp_dir/" 2>/dev/null || true
-    local vm_count=$(ls -1 "/etc/pve/nodes/$old_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
+    vm_count=$(ls -1 "/etc/pve/nodes/$old_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
     log "Found $vm_count VM configurations"
 fi
 
 if [[ -d "/etc/pve/nodes/$old_hostname/lxc" ]]; then
     cp -r "/etc/pve/nodes/$old_hostname/lxc" "$temp_dir/" 2>/dev/null || true
-    local ct_count=$(ls -1 "/etc/pve/nodes/$old_hostname/lxc"/*.conf 2>/dev/null | wc -l)
+    ct_count=$(ls -1 "/etc/pve/nodes/$old_hostname/lxc"/*.conf 2>/dev/null | wc -l)
     log "Found $ct_count container configurations"
 fi
 
@@ -669,14 +669,14 @@ if [[ "$clustered" == "true" ]] && [[ -f "$corosync_backup" ]]; then
     log "Updating cluster configuration..."
     
     # Work with the backed up copy first, then restore it
-    local temp_corosync=$(mktemp)
+    temp_corosync=$(mktemp)
     cp "$corosync_backup" "$temp_corosync"
     
     # Update hostname references in temp file
     sed -i "s/\b$old_hostname\b/$new_hostname/g" "$temp_corosync"
     
     # Increment version number
-    local current_version=$(grep -E '^\s*version:' "$temp_corosync" | awk '{print $2}')
+    current_version=$(grep -E '^\s*version:' "$temp_corosync" | awk '{print $2}')
     if [[ -n "$current_version" ]] && [[ "$current_version" =~ ^[0-9]+$ ]]; then
         local new_version=$((current_version + 1))
         sed -i "s/^\(\s*version:\s*\)$current_version/\1$new_version/" "$temp_corosync"
@@ -702,9 +702,9 @@ fi
 # --- Step 8: Migrate RRD Data ---
 log "Migrating monitoring data..."
 for rrd_dir in node storage vm; do
-    local base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
-    local src="$base_path/$old_hostname"
-    local dst="$base_path/$new_hostname"
+    base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
+    src="$base_path/$old_hostname"
+    dst="$base_path/$new_hostname"
     
     if [[ -d "$src" ]]; then
         mkdir -p "$dst"
@@ -729,13 +729,13 @@ log "Restoring VM and container configurations..."
 
 if [[ -d "$temp_dir/qemu-server" ]]; then
     cp -r "$temp_dir/qemu-server/"* "/etc/pve/nodes/$new_hostname/qemu-server/" 2>/dev/null || true
-    local restored_vms=$(ls -1 "/etc/pve/nodes/$new_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
+    restored_vms=$(ls -1 "/etc/pve/nodes/$new_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
     log "Restored $restored_vms VM configurations"
 fi
 
 if [[ -d "$temp_dir/lxc" ]]; then
     cp -r "$temp_dir/lxc/"* "/etc/pve/nodes/$new_hostname/lxc/" 2>/dev/null || true
-    local restored_cts=$(ls -1 "/etc/pve/nodes/$new_hostname/lxc"/*.conf 2>/dev/null | wc -l)
+    restored_cts=$(ls -1 "/etc/pve/nodes/$new_hostname/lxc"/*.conf 2>/dev/null | wc -l)
     log "Restored $restored_cts container configurations"
 fi
 
