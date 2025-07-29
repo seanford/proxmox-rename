@@ -30,9 +30,9 @@ validate_hostname() {
 
 get_primary_ip() {
     # Try to get IP from default route interface
-    default_iface=$(ip route | awk '/default/ {print $5; exit}')
+    local default_iface=$(ip route | awk '/default/ {print $5; exit}')
     if [[ -n "$default_iface" ]]; then
-        ip_addr=$(ip -4 addr show "$default_iface" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+        local ip_addr=$(ip -4 addr show "$default_iface" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
         if [[ -n "$ip_addr" ]]; then
             echo "$ip_addr"
             return 0
@@ -45,7 +45,7 @@ get_primary_ip() {
 
 stop_services_safely() {
     log "Stopping Proxmox services..."
-    services=("pvestatd" "pvedaemon" "pveproxy" "pve-cluster")
+    local services=("pvestatd" "pvedaemon" "pveproxy" "pve-cluster")
     
     for service in "${services[@]}"; do
         if systemctl is-active --quiet "$service"; then
@@ -53,7 +53,7 @@ stop_services_safely() {
             systemctl stop "$service"
             
             # Wait for service to actually stop
-            timeout=30
+            local timeout=30
             while systemctl is-active --quiet "$service" && [ $timeout -gt 0 ]; do
                 sleep 1
                 ((timeout--))
@@ -109,8 +109,8 @@ start_services_safely() {
     
     # Start cluster service first with retries
     log "Starting pve-cluster service..."
-    cluster_attempts=0
-    max_attempts=3
+    local cluster_attempts=0
+    local max_attempts=3
     
     while [ $cluster_attempts -lt $max_attempts ]; do
         systemctl start pve-cluster
@@ -140,7 +140,7 @@ start_services_safely() {
     done
     
     # Wait for pmxcfs to be ready
-    timeout=30
+    local timeout=30
     while [ $timeout -gt 0 ] && ! mountpoint -q /etc/pve; do
         sleep 1
         ((timeout--))
@@ -155,7 +155,7 @@ start_services_safely() {
     
     # Start other services
     sleep 3
-    services=("pveproxy" "pvedaemon" "pvestatd")
+    local services=("pveproxy" "pvedaemon" "pvestatd")
     for service in "${services[@]}"; do
         log "Starting $service..."
         systemctl start "$service"
@@ -172,8 +172,8 @@ start_services_safely() {
 }
 
 get_running_guests() {
-    running_vms=()
-    running_cts=()
+    local running_vms=()
+    local running_cts=()
     
     # Get running VMs
     if command -v qm >/dev/null 2>&1; then
@@ -200,11 +200,11 @@ get_running_guests() {
 
 stop_all_guests() {
     log "Stopping all running VMs and containers..."
-    stopped_guests=()
+    local stopped_guests=()
     
     # Stop VMs
     if command -v qm >/dev/null 2>&1; then
-        running_vms=($(qm list 2>/dev/null | awk 'NR>1 && $3=="running" {print $1}'))
+        local running_vms=($(qm list 2>/dev/null | awk 'NR>1 && $3=="running" {print $1}'))
         for vmid in "${running_vms[@]}"; do
             log "Stopping VM $vmid..."
             if qm stop "$vmid" >/dev/null 2>&1; then
@@ -220,7 +220,7 @@ stop_all_guests() {
     
     # Stop containers
     if command -v pct >/dev/null 2>&1; then
-        running_cts=($(pct list 2>/dev/null | awk 'NR>1 && $2=="running" {print $1}'))
+        local running_cts=($(pct list 2>/dev/null | awk 'NR>1 && $2=="running" {print $1}'))
         for ctid in "${running_cts[@]}"; do
             log "Stopping container $ctid..."
             if pct stop "$ctid" >/dev/null 2>&1; then
@@ -243,7 +243,7 @@ stop_all_guests() {
 }
 
 start_previously_running_guests() {
-    guests_file="$backup_dir/stopped_guests.list"
+    local guests_file="$backup_dir/stopped_guests.list"
     
     if [[ ! -f "$guests_file" ]]; then
         log "No previously running guests to restart"
@@ -251,46 +251,6 @@ start_previously_running_guests() {
     fi
     
     log "Starting previously running guests..."
-    started_count=0
-    failed_count=0
-    
-    while IFS= read -r guest; do
-        [[ -z "$guest" ]] && continue
-        
-        type="${guest%:*}"
-        id="${guest#*:}"
-        
-        if [[ "$type" == "vm" ]]; then
-            log "Starting VM $id..."
-            if qm start "$id" >/dev/null 2>&1; then
-                log "VM $id started successfully"
-                ((started_count++))
-            else
-                log "ERROR: Failed to start VM $id"
-                ((failed_count++))
-            fi
-        elif [[ "$type" == "ct" ]]; then
-            log "Starting container $id..."
-            if pct start "$id" >/dev/null 2>&1; then
-                log "Container $id started successfully"
-                ((started_count++))
-            else
-                log "ERROR: Failed to start container $id"
-                ((failed_count++))
-            fi
-        fi
-        
-        # Small delay between starts
-        sleep 2
-    done < "$guests_file"
-    
-    log "Guest restart summary: $started_count started, $failed_count failed"
-    
-    if [[ $failed_count -gt 0 ]]; then
-        echo "WARNING: $failed_count guests failed to start automatically"
-        echo "You may need to start them manually through the web interface"
-    fi
-}
     local started_count=0
     local failed_count=0
     
@@ -331,6 +291,8 @@ start_previously_running_guests() {
         echo "You may need to start them manually through the web interface"
     fi
 }
+
+preflight_checks() {
     log "Running preflight checks..."
     
     # Check if running as root
@@ -386,7 +348,7 @@ verify_completion() {
     log "Verifying rename completion..."
     
     # Check hostname
-    current_hostname=$(hostname)
+    local current_hostname=$(hostname)
     if [[ "$current_hostname" != "$new_hostname" ]]; then
         log "ERROR: Hostname verification failed. Expected: $new_hostname, Got: $current_hostname"
         return 1
@@ -404,8 +366,8 @@ verify_completion() {
     fi
     
     # Check services are running
-    services=("pveproxy" "pvedaemon" "pvestatd" "pve-cluster")
-    failed_services=0
+    local services=("pveproxy" "pvedaemon" "pvestatd" "pve-cluster")
+    local failed_services=0
     
     for service in "${services[@]}"; do
         if ! systemctl is-active --quiet "$service"; then
@@ -475,7 +437,7 @@ rollback() {
     
     # Restore RRD data
     for rrd_dir in node storage vm; do
-        base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
+        local base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
         if [[ -d "$backup_dir/pve2-$rrd_dir-$old_hostname" ]]; then
             if [[ -d "$base_path/$new_hostname" ]]; then
                 rm -rf "$base_path/$new_hostname"
@@ -641,8 +603,8 @@ fi
 
 # Backup RRD monitoring data
 for rrd_dir in node storage vm; do
-    base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
-    src="$base_path/$old_hostname"
+    local base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
+    local src="$base_path/$old_hostname"
     if [[ -d "$src" ]]; then
         cp -a "$src" "$backup_dir/pve2-$rrd_dir-$old_hostname"
         log "Backed up RRD data: $rrd_dir"
@@ -661,13 +623,13 @@ trap "rm -rf $temp_dir; rollback" ERR
 
 if [[ -d "/etc/pve/nodes/$old_hostname/qemu-server" ]]; then
     cp -r "/etc/pve/nodes/$old_hostname/qemu-server" "$temp_dir/" 2>/dev/null || true
-    vm_count=$(ls -1 "/etc/pve/nodes/$old_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
+    local vm_count=$(ls -1 "/etc/pve/nodes/$old_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
     log "Found $vm_count VM configurations"
 fi
 
 if [[ -d "/etc/pve/nodes/$old_hostname/lxc" ]]; then
     cp -r "/etc/pve/nodes/$old_hostname/lxc" "$temp_dir/" 2>/dev/null || true
-    ct_count=$(ls -1 "/etc/pve/nodes/$old_hostname/lxc"/*.conf 2>/dev/null | wc -l)
+    local ct_count=$(ls -1 "/etc/pve/nodes/$old_hostname/lxc"/*.conf 2>/dev/null | wc -l)
     log "Found $ct_count container configurations"
 fi
 
@@ -707,16 +669,16 @@ if [[ "$clustered" == "true" ]] && [[ -f "$corosync_backup" ]]; then
     log "Updating cluster configuration..."
     
     # Work with the backed up copy first, then restore it
-    temp_corosync=$(mktemp)
+    local temp_corosync=$(mktemp)
     cp "$corosync_backup" "$temp_corosync"
     
     # Update hostname references in temp file
     sed -i "s/\b$old_hostname\b/$new_hostname/g" "$temp_corosync"
     
     # Increment version number
-    current_version=$(grep -E '^\s*version:' "$temp_corosync" | awk '{print $2}')
+    local current_version=$(grep -E '^\s*version:' "$temp_corosync" | awk '{print $2}')
     if [[ -n "$current_version" ]] && [[ "$current_version" =~ ^[0-9]+$ ]]; then
-        new_version=$((current_version + 1))
+        local new_version=$((current_version + 1))
         sed -i "s/^\(\s*version:\s*\)$current_version/\1$new_version/" "$temp_corosync"
         log "Updated corosync.conf version: $current_version -> $new_version"
     else
@@ -740,9 +702,9 @@ fi
 # --- Step 8: Migrate RRD Data ---
 log "Migrating monitoring data..."
 for rrd_dir in node storage vm; do
-    base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
-    src="$base_path/$old_hostname"
-    dst="$base_path/$new_hostname"
+    local base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
+    local src="$base_path/$old_hostname"
+    local dst="$base_path/$new_hostname"
     
     if [[ -d "$src" ]]; then
         mkdir -p "$dst"
@@ -767,13 +729,13 @@ log "Restoring VM and container configurations..."
 
 if [[ -d "$temp_dir/qemu-server" ]]; then
     cp -r "$temp_dir/qemu-server/"* "/etc/pve/nodes/$new_hostname/qemu-server/" 2>/dev/null || true
-    restored_vms=$(ls -1 "/etc/pve/nodes/$new_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
+    local restored_vms=$(ls -1 "/etc/pve/nodes/$new_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
     log "Restored $restored_vms VM configurations"
 fi
 
 if [[ -d "$temp_dir/lxc" ]]; then
     cp -r "$temp_dir/lxc/"* "/etc/pve/nodes/$new_hostname/lxc/" 2>/dev/null || true
-    restored_cts=$(ls -1 "/etc/pve/nodes/$new_hostname/lxc"/*.conf 2>/dev/null | wc -l)
+    local restored_cts=$(ls -1 "/etc/pve/nodes/$new_hostname/lxc"/*.conf 2>/dev/null | wc -l)
     log "Restored $restored_cts container configurations"
 fi
 
