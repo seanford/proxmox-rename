@@ -1535,23 +1535,72 @@ complete_node_migration() {
         exit 1
     fi
     
-    # Check if old node directory still exists and move it
+    # Check if old node directory still exists
     if [[ -d "/etc/pve/nodes/$old_hostname" ]]; then
-        log "Moving node directory: $old_hostname -> $new_hostname"
+        log "Found old node directory: $old_hostname"
         
-        # Atomic move operation
-        if mv "/etc/pve/nodes/$old_hostname" "/etc/pve/nodes/$new_hostname"; then
-            log "Node directory moved successfully"
-        else
-            log_error "Failed to move node directory - attempting recovery"
+        # Check if new directory already exists
+        if [[ -d "/etc/pve/nodes/$new_hostname" ]]; then
+            log "New directory already exists, merging contents..."
             
-            # Try to create new directory and copy configurations
-            create_new_node_directory
+            # Merge contents from old to new directory
+            if [[ -d "/etc/pve/nodes/$old_hostname/qemu-server" ]]; then
+                mkdir -p "/etc/pve/nodes/$new_hostname/qemu-server"
+                if cp -r "/etc/pve/nodes/$old_hostname/qemu-server/"* "/etc/pve/nodes/$new_hostname/qemu-server/" 2>/dev/null; then
+                    log_debug "Merged VM configurations"
+                else
+                    log_warn "No VM configurations to merge or merge failed"
+                fi
+            fi
+            
+            if [[ -d "/etc/pve/nodes/$old_hostname/lxc" ]]; then
+                mkdir -p "/etc/pve/nodes/$new_hostname/lxc"
+                if cp -r "/etc/pve/nodes/$old_hostname/lxc/"* "/etc/pve/nodes/$new_hostname/lxc/" 2>/dev/null; then
+                    log_debug "Merged container configurations"
+                else
+                    log_warn "No container configurations to merge or merge failed"
+                fi
+            fi
+            
+            # Copy any other files/directories that might exist
+            for item in "/etc/pve/nodes/$old_hostname/"*; do
+                if [[ -e "$item" ]]; then
+                    local basename_item
+                    basename_item=$(basename "$item")
+                    if [[ "$basename_item" != "qemu-server" && "$basename_item" != "lxc" ]]; then
+                        if cp -r "$item" "/etc/pve/nodes/$new_hostname/" 2>/dev/null; then
+                            log_debug "Copied additional item: $basename_item"
+                        else
+                            log_warn "Failed to copy item: $basename_item"
+                        fi
+                    fi
+                fi
+            done
+            
+            # Remove old directory after successful merge
+            if rm -rf "/etc/pve/nodes/$old_hostname" 2>/dev/null; then
+                log "Successfully merged and removed old node directory"
+            else
+                log_warn "Failed to remove old node directory after merge"
+            fi
+        else
+            # New directory doesn't exist, safe to move
+            log "Moving node directory: $old_hostname -> $new_hostname"
+            if mv "/etc/pve/nodes/$old_hostname" "/etc/pve/nodes/$new_hostname"; then
+                log "Node directory moved successfully"
+            else
+                log_error "Failed to move node directory - attempting recovery"
+                create_new_node_directory
+            fi
         fi
     else
-        # Old directory doesn't exist, create new one
-        log "Creating new node directory structure"
-        create_new_node_directory
+        # Old directory doesn't exist, check if new one exists
+        if [[ -d "/etc/pve/nodes/$new_hostname" ]]; then
+            log "New node directory already exists"
+        else
+            log "Creating new node directory structure"
+            create_new_node_directory
+        fi
     fi
     
     # Verify the new directory exists and has content
@@ -1560,7 +1609,19 @@ complete_node_migration() {
         exit 1
     fi
     
-    log "Node directory migration completed"
+    # Check if we have configurations in the new directory
+    local vm_count=0
+    local ct_count=0
+    
+    if [[ -d "/etc/pve/nodes/$new_hostname/qemu-server" ]]; then
+        vm_count=$(find "/etc/pve/nodes/$new_hostname/qemu-server" -name "*.conf" 2>/dev/null | wc -l)
+    fi
+    
+    if [[ -d "/etc/pve/nodes/$new_hostname/lxc" ]]; then
+        ct_count=$(find "/etc/pve/nodes/$new_hostname/lxc" -name "*.conf" 2>/dev/null | wc -l)
+    fi
+    
+    log "Node directory migration completed: $vm_count VMs, $ct_count containers"
 }
 
 cleanup_successful_operation() {
