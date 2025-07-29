@@ -603,8 +603,8 @@ fi
 
 # Backup RRD monitoring data
 for rrd_dir in node storage vm; do
-    base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
-    src="$base_path/$old_hostname"
+    local base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
+    local src="$base_path/$old_hostname"
     if [[ -d "$src" ]]; then
         cp -a "$src" "$backup_dir/pve2-$rrd_dir-$old_hostname"
         log "Backed up RRD data: $rrd_dir"
@@ -623,13 +623,13 @@ trap "rm -rf $temp_dir; rollback" ERR
 
 if [[ -d "/etc/pve/nodes/$old_hostname/qemu-server" ]]; then
     cp -r "/etc/pve/nodes/$old_hostname/qemu-server" "$temp_dir/" 2>/dev/null || true
-    vm_count=$(ls -1 "/etc/pve/nodes/$old_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
+    local vm_count=$(ls -1 "/etc/pve/nodes/$old_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
     log "Found $vm_count VM configurations"
 fi
 
 if [[ -d "/etc/pve/nodes/$old_hostname/lxc" ]]; then
     cp -r "/etc/pve/nodes/$old_hostname/lxc" "$temp_dir/" 2>/dev/null || true
-    ct_count=$(ls -1 "/etc/pve/nodes/$old_hostname/lxc"/*.conf 2>/dev/null | wc -l)
+    local ct_count=$(ls -1 "/etc/pve/nodes/$old_hostname/lxc"/*.conf 2>/dev/null | wc -l)
     log "Found $ct_count container configurations"
 fi
 
@@ -664,47 +664,12 @@ if ! grep -q "^$ip_address.*$new_hostname" /etc/hosts; then
     log "Added new hostname entry to /etc/hosts"
 fi
 
-# --- Step 7: Update corosync.conf if clustered ---
-if [[ "$clustered" == "true" ]] && [[ -f "$corosync_backup" ]]; then
-    log "Updating cluster configuration..."
-    
-    # Work with the backed up copy first, then restore it
-    temp_corosync=$(mktemp)
-    cp "$corosync_backup" "$temp_corosync"
-    
-    # Update hostname references in temp file
-    sed -i "s/\b$old_hostname\b/$new_hostname/g" "$temp_corosync"
-    
-    # Increment version number
-    current_version=$(grep -E '^\s*version:' "$temp_corosync" | awk '{print $2}')
-    if [[ -n "$current_version" ]] && [[ "$current_version" =~ ^[0-9]+$ ]]; then
-        local new_version=$((current_version + 1))
-        sed -i "s/^\(\s*version:\s*\)$current_version/\1$new_version/" "$temp_corosync"
-        log "Updated corosync.conf version: $current_version -> $new_version"
-    else
-        log "WARNING: Could not update corosync.conf version automatically"
-    fi
-    
-    # Copy the updated file back to the correct location
-    if [[ -f "/etc/pve/corosync.conf" ]] || [[ "$corosync_conf" == "/etc/pve/corosync.conf" ]]; then
-        cp "$temp_corosync" "/etc/pve/corosync.conf"
-        log "Updated /etc/pve/corosync.conf"
-    elif [[ -f "/etc/corosync/corosync.conf" ]] || [[ "$corosync_conf" == "/etc/corosync/corosync.conf" ]]; then
-        cp "$temp_corosync" "/etc/corosync/corosync.conf"
-        log "Updated /etc/corosync/corosync.conf"
-    fi
-    
-    rm -f "$temp_corosync"
-elif [[ "$clustered" == "true" ]]; then
-    log "WARNING: Cluster detected but no corosync.conf found to update"
-fi
-
-# --- Step 8: Migrate RRD Data ---
+# --- Step 7: Migrate RRD Data ---
 log "Migrating monitoring data..."
 for rrd_dir in node storage vm; do
-    base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
-    src="$base_path/$old_hostname"
-    dst="$base_path/$new_hostname"
+    local base_path="/var/lib/rrdcached/db/pve2-$rrd_dir"
+    local src="$base_path/$old_hostname"
+    local dst="$base_path/$new_hostname"
     
     if [[ -d "$src" ]]; then
         mkdir -p "$dst"
@@ -714,42 +679,186 @@ for rrd_dir in node storage vm; do
     fi
 done
 
-# --- Step 9: Update Node Directory Structure ---
-log "Updating node directory structure..."
+# --- Step 8: Clean up cluster state and restart cluster service ---
+log "Cleaning up cluster state before service restart..."
 
-# Remove old node directory
-rm -rf "/etc/pve/nodes/$old_hostname"
-
-# Create new node directory structure
-mkdir -p "/etc/pve/nodes/$new_hostname/qemu-server"
-mkdir -p "/etc/pve/nodes/$new_hostname/lxc"
-
-# --- Step 10: Restore VM and Container Configurations ---
-log "Restoring VM and container configurations..."
-
-if [[ -d "$temp_dir/qemu-server" ]]; then
-    cp -r "$temp_dir/qemu-server/"* "/etc/pve/nodes/$new_hostname/qemu-server/" 2>/dev/null || true
-    restored_vms=$(ls -1 "/etc/pve/nodes/$new_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
-    log "Restored $restored_vms VM configurations"
+# Clean up cluster database
+if [[ -d "/var/lib/pve-cluster" ]]; then
+    log "Removing cluster database files..."
+    rm -rf /var/lib/pve-cluster/*
+    log "Cluster database cleaned"
 fi
 
-if [[ -d "$temp_dir/lxc" ]]; then
-    cp -r "$temp_dir/lxc/"* "/etc/pve/nodes/$new_hostname/lxc/" 2>/dev/null || true
-    restored_cts=$(ls -1 "/etc/pve/nodes/$new_hostname/lxc"/*.conf 2>/dev/null | wc -l)
-    log "Restored $restored_cts container configurations"
+# Start pve-cluster service first (this will recreate /etc/pve mount)
+log "Starting pve-cluster service with new hostname..."
+local cluster_attempts=0
+local max_attempts=3
+
+while [ $cluster_attempts -lt $max_attempts ]; do
+    systemctl start pve-cluster
+    sleep 5
+    
+    if systemctl is-active --quiet pve-cluster; then
+        log "pve-cluster started successfully"
+        break
+    else
+        ((cluster_attempts++))
+        log "pve-cluster start attempt $cluster_attempts failed, retrying..."
+        
+        # Clean up and try again
+        systemctl stop pve-cluster 2>/dev/null || true
+        pkill -9 pmxcfs 2>/dev/null || true
+        if mountpoint -q /etc/pve; then
+            umount -f /etc/pve 2>/dev/null || umount -l /etc/pve 2>/dev/null || true
+        fi
+        rm -rf /var/lib/pve-cluster/*
+        sleep 3
+        
+        if [ $cluster_attempts -eq $max_attempts ]; then
+            log "ERROR: pve-cluster failed to start after $max_attempts attempts"
+            log "This may require manual intervention"
+            exit 1
+        fi
+    fi
+done
+
+# Wait for pmxcfs to be ready and /etc/pve to be mounted
+local timeout=30
+while [ $timeout -gt 0 ] && ! mountpoint -q /etc/pve; do
+    sleep 1
+    ((timeout--))
+done
+
+if ! mountpoint -q /etc/pve; then
+    log "ERROR: /etc/pve is not mounted after starting pve-cluster"
+    exit 1
+else
+    log "/etc/pve filesystem is mounted and ready"
 fi
 
-# --- Step 11: Update Storage Configuration ---
+# --- Step 9: Update cluster configuration files in place ---
+if [[ "$clustered" == "true" ]] && [[ -f "$corosync_backup" ]]; then
+    log "Updating cluster configuration in place..."
+    
+    # Update corosync.conf in place
+    if [[ -f "/etc/pve/corosync.conf" ]]; then
+        log "Updating /etc/pve/corosync.conf..."
+        # Make a backup of current state
+        cp "/etc/pve/corosync.conf" "/etc/pve/corosync.conf.pre-rename"
+        
+        # Update hostname references
+        sed -i "s/\b$old_hostname\b/$new_hostname/g" /etc/pve/corosync.conf
+        
+        # Increment version number
+        local current_version=$(grep -E '^\s*version:' /etc/pve/corosync.conf | awk '{print $2}')
+        if [[ -n "$current_version" ]] && [[ "$current_version" =~ ^[0-9]+$ ]]; then
+            local new_version=$((current_version + 1))
+            sed -i "s/^\(\s*version:\s*\)$current_version/\1$new_version/" /etc/pve/corosync.conf
+            log "Updated corosync.conf version: $current_version -> $new_version"
+        else
+            log "WARNING: Could not update corosync.conf version automatically"
+        fi
+        
+        log "Updated /etc/pve/corosync.conf in place"
+    elif [[ -f "/etc/corosync/corosync.conf" ]]; then
+        log "Updating /etc/corosync/corosync.conf..."
+        # Update the local corosync.conf file
+        sed -i "s/\b$old_hostname\b/$new_hostname/g" /etc/corosync/corosync.conf
+        
+        # Increment version number
+        local current_version=$(grep -E '^\s*version:' /etc/corosync/corosync.conf | awk '{print $2}')
+        if [[ -n "$current_version" ]] && [[ "$current_version" =~ ^[0-9]+$ ]]; then
+            local new_version=$((current_version + 1))
+            sed -i "s/^\(\s*version:\s*\)$current_version/\1$new_version/" /etc/corosync/corosync.conf
+            log "Updated corosync.conf version: $current_version -> $new_version"
+        fi
+        
+        log "Updated /etc/corosync/corosync.conf"
+    fi
+elif [[ "$clustered" == "true" ]]; then
+    log "WARNING: Cluster detected but no corosync.conf found to update"
+fi
+
+# --- Step 10: Update storage configuration in place ---
 if [[ -f "/etc/pve/storage.cfg" ]]; then
-    log "Updating storage configuration references..."
+    log "Updating storage configuration references in place..."
     # Update any hostname references in storage.cfg
     sed -i "s/\b$old_hostname\b/$new_hostname/g" /etc/pve/storage.cfg
+    log "Updated /etc/pve/storage.cfg"
 fi
 
-# --- Step 12: Start Services ---
-start_services_safely
+# --- Step 11: Move node directory and restore configurations ---
+log "Moving node directory and restoring configurations..."
 
-# --- Step 13: Verify and Cleanup ---
+# Move old node directory to new name if it exists
+if [[ -d "/etc/pve/nodes/$old_hostname" ]]; then
+    mv "/etc/pve/nodes/$old_hostname" "/etc/pve/nodes/$new_hostname"
+    log "Moved node directory from $old_hostname to $new_hostname"
+else
+    # Create new node directory structure if it doesn't exist
+    mkdir -p "/etc/pve/nodes/$new_hostname/qemu-server"
+    mkdir -p "/etc/pve/nodes/$new_hostname/lxc"
+    log "Created new node directory structure"
+    
+    # Restore VM and container configurations
+    if [[ -d "$temp_dir/qemu-server" ]]; then
+        cp -r "$temp_dir/qemu-server/"* "/etc/pve/nodes/$new_hostname/qemu-server/" 2>/dev/null || true
+        local restored_vms=$(ls -1 "/etc/pve/nodes/$new_hostname/qemu-server"/*.conf 2>/dev/null | wc -l)
+        log "Restored $restored_vms VM configurations"
+    fi
+
+    if [[ -d "$temp_dir/lxc" ]]; then
+        cp -r "$temp_dir/lxc/"* "/etc/pve/nodes/$new_hostname/lxc/" 2>/dev/null || true
+        local restored_cts=$(ls -1 "/etc/pve/nodes/$new_hostname/lxc"/*.conf 2>/dev/null | wc -l)
+        log "Restored $restored_cts container configurations"
+    fi
+fi
+
+# --- Step 12: Wait for cluster synchronization ---
+log "Waiting 30 seconds for cluster synchronization..."
+sleep 30
+
+# --- Step 13: Restart all services to pick up changes ---
+log "Restarting all Proxmox services to pick up changes..."
+
+# Stop services
+systemctl stop pvestatd pvedaemon pveproxy 2>/dev/null || true
+sleep 2
+
+# Restart cluster service
+systemctl restart pve-cluster
+sleep 5
+
+# Wait for /etc/pve to be ready again
+local timeout=30
+while [ $timeout -gt 0 ] && ! mountpoint -q /etc/pve; do
+    sleep 1
+    ((timeout--))
+done
+
+if ! mountpoint -q /etc/pve; then
+    log "WARNING: /etc/pve is not mounted after cluster restart"
+else
+    log "/etc/pve filesystem is ready after restart"
+fi
+
+# Start other services
+local services=("pveproxy" "pvedaemon" "pvestatd")
+for service in "${services[@]}"; do
+    log "Starting $service..."
+    systemctl start "$service"
+    sleep 2
+    if systemctl is-active --quiet "$service"; then
+        log "$service started successfully"
+    else
+        log "WARNING: $service may not have started properly"
+        # Try once more
+        sleep 2
+        systemctl start "$service" 2>/dev/null || true
+    fi
+done
+
+# --- Step 14: Verify and Cleanup ---
 if verify_completion; then
     # Only cleanup backup if verification succeeds
     trap - ERR
